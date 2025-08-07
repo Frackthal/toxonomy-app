@@ -218,7 +218,7 @@ function App() {
                           onClick={() => setActiveTabs(prev => ({ ...prev, [cas]: table }))}
                           className={`cursor-pointer px-2 py-1 rounded mb-1 text-sm ${currentTab === table ? 'bg-teal-600 text-white' : 'hover:bg-gray-100 dark:hover:bg-gray-600'}`}
                         >
-                          {table.replaceAll('_', ' ')}
+                          {table.replace('_', ' ')}
                         </div>
                       ))}
                     </div>
@@ -333,17 +333,17 @@ function App() {
 								: 'hover:bg-gray-100 dark:hover:bg-gray-600'
 							}`}
 						  >
-							{table.replaceAll('_', ' ')}
+							{table.replace('_', ' ')}
 						  </button>
 						))}
 					  </div>
 
 					  {/* Tableau */}
-					  <div className="w-full mt-4 overflow-x-auto"><div className="min-w-[600px]">
+					  <div className="w-full mt-4 overflow-x-auto">
 						  {(() => {
 						    const tabData = details[currentTab];
 						    return tabData && tabData.columns && tabData.rows && (
-						      <table className="w-full text-sm text-left border-collapse border border-gray-300 dark:border-gray-600">
+						      <table className="min-w-[600px] text-sm text-left border-collapse border border-gray-300 dark:border-gray-600">
 						        <thead>
 						          <tr>
 						            {tabData.columns.map((col) => (
@@ -365,8 +365,6 @@ function App() {
 						          ))}
 						        </tbody>
 						      </table>
-  </div>
-</div>
 						    );
 						  })()}
 						</div>
@@ -541,7 +539,7 @@ function App() {
                                   onClick={() => setActiveTabs(prev => ({ ...prev, [cas]: table }))}
                                   className={`cursor-pointer px-2 py-1 rounded mb-1 text-sm ${currentTab === table ? 'bg-teal-600 text-white' : 'hover:bg-gray-100 dark:hover:bg-gray-600'}`}
                                 >
-                                  {table.replaceAll('_', ' ')}
+                                  {table.replace('_', ' ')}
                                 </div>
                               ))}
                             </div>
