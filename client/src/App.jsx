@@ -339,11 +339,11 @@ function App() {
 					  </div>
 
 					  {/* Tableau */}
-					  <div className="overflow-x-auto mt-4 max-w-full">
+					  <div className="w-full mt-4 overflow-x-auto"><div className="min-w-[600px]">
 						  {(() => {
 						    const tabData = details[currentTab];
 						    return tabData && tabData.columns && tabData.rows && (
-						      <table className="w-full min-w-[600px] text-sm text-left border-collapse border border-gray-300 dark:border-gray-600">
+						      <table className="w-full text-sm text-left border-collapse border border-gray-300 dark:border-gray-600">
 						        <thead>
 						          <tr>
 						            {tabData.columns.map((col) => (
