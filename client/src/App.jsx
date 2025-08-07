@@ -340,37 +340,34 @@ function App() {
 
 					  {/* Tableau */}
 					  <div className="overflow-x-auto mt-4">
-						{(() => {
-						  const tabData = details[currentTab];
-						  return tabData && tabData.columns && tabData.rows && (
-							<table className="w-full text-sm text-left border-collapse border border-gray-300 dark:border-gray-600 min-w-[600px]">
-							  <thead>
-								<tr>
-								  {tabData.columns.map((col) => (
-									<th
-									  key={col}
-									  className="border px-2 py-1 bg-gray-100 dark:bg-gray-700"
-									>
-									  {col}
-									</th>
-								  ))}
-								</tr>
-							  </thead>
-							  <tbody>
-								{tabData.rows.map((row, idx) => (
-								  <tr key={idx}>
-									{tabData.columns.map((col) => (
-									  <td key={col} className="border px-2 py-1">
-										{row[col]}
-									  </td>
-									))}
-								  </tr>
-								))}
-							  </tbody>
-							</table>
-						  );
-						})()}
-					  </div>
+						  {(() => {
+						    const tabData = details[currentTab];
+						    return tabData && tabData.columns && tabData.rows && (
+						      <table className="w-fit min-w-[600px] text-sm text-left border-collapse border border-gray-300 dark:border-gray-600">
+						        <thead>
+						          <tr>
+						            {tabData.columns.map((col) => (
+						              <th key={col} className="border px-2 py-1 bg-gray-100 dark:bg-gray-700">
+						                {col}
+						              </th>
+						            ))}
+						          </tr>
+						        </thead>
+						        <tbody>
+						          {tabData.rows.map((row, idx) => (
+						            <tr key={idx}>
+						              {tabData.columns.map((col) => (
+						                <td key={col} className="border px-2 py-1">
+						                  {row[col]}
+						                </td>
+						              ))}
+						            </tr>
+						          ))}
+						        </tbody>
+						      </table>
+						    );
+						  })()}
+						</div>
 					</div>
                 )}
               </>
@@ -540,7 +537,7 @@ function App() {
                                 <div
                                   key={table}
                                   onClick={() => setActiveTabs(prev => ({ ...prev, [cas]: table }))}
-                                  className={"cursor-pointer px-2 py-1 rounded mb-1 text-sm ${currentTab === table ? 'bg-teal-600 text-white' : 'hover:bg-gray-100 dark:hover:bg-gray-600'}"}
+                                  className={`cursor-pointer px-2 py-1 rounded mb-1 text-sm ${currentTab === table ? 'bg-teal-600 text-white' : 'hover:bg-gray-100 dark:hover:bg-gray-600'}`}
                                 >
                                   {table.replace('_', ' ')}
                                 </div>
