@@ -60,7 +60,7 @@ function App() {
   const handleSearch = async () => {
     const casNumbers = casList.split('\n').map(c => c.trim()).filter(Boolean);
     const selectedTables = classifications.map(c => c.value);
-    const response = await fetch('${API_BASE}/search', {
+    const response = await fetch(`${API_BASE}/search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cas_numbers: casNumbers, classifications: selectedTables })
@@ -75,7 +75,7 @@ function App() {
   const handleExport = async (format) => {
     const casNumbers = casList.split('\n').map(c => c.trim()).filter(Boolean);
     const selectedTables = classifications.map(c => c.value);
-    const response = await fetch("${API_BASE}/export/${format}", {
+    const response = await fetch(`${API_BASE}/export/${format}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cas_numbers: casNumbers, classifications: selectedTables })
@@ -177,7 +177,7 @@ function App() {
         className="w-full bg-teal-600 text-white px-4 py-2 rounded hover:bg-teal-700 flex items-center justify-center gap-2"
         onClick={async () => {
           const casNumbers = casList.split('\n').map(c => c.trim()).filter(Boolean);
-          const response = await fetch('${API_BASE}/toxicology', {
+          const response = await fetch(`${API_BASE}/toxicology`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ cas_numbers: casNumbers })
@@ -260,7 +260,7 @@ function App() {
         className="w-full bg-teal-600 text-white px-4 py-2 rounded hover:bg-teal-700 flex items-center justify-center gap-2"
         onClick={async () => {
           const casNumbers = casList.split('\n').map(c => c.trim()).filter(Boolean);
-          const response = await fetch('${API_BASE}/vtr', {
+          const response = await fetch(`${API_BASE}/vtr`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ cas_numbers: casNumbers })
@@ -278,7 +278,7 @@ function App() {
 	  className="w-full bg-blue-900 text-white px-4 py-2 rounded hover:bg-blue-800 flex items-center justify-center gap-2"
 	  onClick={async () => {
 		const casNumbers = casList.split('\n').map(c => c.trim()).filter(Boolean);
-		const response = await fetch('${API_BASE}/vtr_export/xlsx', {
+		const response = await fetch(`${API_BASE}/vtr_export/xlsx`, {
 		  method: 'POST',
 		  headers: { 'Content-Type': 'application/json' },
 		  body: JSON.stringify({ cas_numbers: casNumbers })
