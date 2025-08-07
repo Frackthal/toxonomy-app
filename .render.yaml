@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: toxonomy-backend
+    env: python
+    rootDir: server
+    buildCommand: ""
+    startCommand: gunicorn main:app
+    plan: free
+    envVars:
+      - key: FLASK_ENV
+        value: production
+    buildFilter:
+      paths:
+        - server/**
+
+  - type: web
+    name: toxonomy-frontend
+    env: static
+    rootDir: client
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    plan: free
+    buildFilter:
+      paths:
+        - client/**
