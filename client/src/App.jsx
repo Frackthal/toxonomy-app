@@ -21,13 +21,16 @@ const flatOptions = [
   { label: 'USEPA Carcinogens', value: 'USEPA_Carcinogens', group: 'Cancérogénicité' },
   { label: 'MAK Carcinogens', value: 'MAK_Carcinogens', group: 'Cancérogénicité' },
   { label: 'NTP Carcinogens', value: 'NTP_Carcinogens', group: 'Cancérogénicité' },
+  { label: 'OEHHA', value: 'OEHHA', group: 'Cancérogénicité' },
   { label: 'BKH-DHI', value: 'BKH_DHI', group: 'Perturbateurs endocriniens' },
   { label: 'DEDuCT', value: 'DEDuCT', group: 'Perturbateurs endocriniens' },
   { label: 'EU EDlists', value: 'EU_EDlists', group: 'Perturbateurs endocriniens' },
   { label: 'USEPA ED', value: 'USEPA_ED', group: 'Perturbateurs endocriniens' },
   { label: 'SINList', value: 'SINList', group: 'Perturbateurs endocriniens' },
   { label: 'TEDX', value: 'TEDX', group: 'Perturbateurs endocriniens' },
+  { label: 'AOEC Asthmagens', value: 'AOEC_Asthmagens', group: 'Autres' },
   { label: 'FEMA', value: 'FEMA', group: 'Autres' },
+  { label: 'HAZMAP', value: 'HAZMAP', group: 'Autres' },
   { label: 'MAK Allergens', value: 'MAK_Allergens', group: 'Autres' },
   { label: 'HPHC', value: 'HPHC', group: 'Autres' }
 ];
