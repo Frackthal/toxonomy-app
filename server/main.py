@@ -45,8 +45,8 @@ SPECIAL_CARCINOGENICITY = {
     ],
     "NTP_Carcinogens": lambda row: dict(row).get("Listing") and str(row["Listing"]).strip() != "",
     "MAK_Carcinogens": lambda row: dict(row).get("Category") and str(row["Category"]).strip() != "",
-    "ACGIH": lambda row: any(x in str(row.get("Notation", "")).upper() for x in ["A1", "A2", "A3"],
-    "OEHHA": lambda row: "cancer" in str(row.get("Toxicity", "")).lower())
+    "ACGIH": lambda row: any((x in str(row.get("Notation", "")).upper()) for x in ["A1", "A2", "A3"]),
+    "OEHHA": lambda row: "cancer" in str(row.get("Toxicity", "")).lower(),
 }
 
 def normalize_cas(cas):
