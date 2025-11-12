@@ -6,6 +6,10 @@ import re
 import pandas as pd
 from flask import send_file
 from io import BytesIO, StringIO
+from download_db import download_db
+
+download_db("Classifications.db")
+download_db("VTR.db")
 
 app = Flask(__name__, static_folder='../client/dist', static_url_path='/')
 CORS(app, resources={r"/api/*": {"origins": "*"}})
