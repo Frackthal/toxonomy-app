@@ -41,7 +41,7 @@ function Documentation() {
 	{
 	  title: 'ATSDR Hazards',
 	  content: `Les ATSDR Hazards sont issus de la rubrique "Health Effects of Exposure to Substances" de l’ATSDR. Ils rassemblent les effets sanitaires associés à l’exposition à diverses substances chimiques, organisés par systèmes d’organes et types d’effets, afin de faciliter l’identification des dangers pour la santé humaine.`
-	}
+	},
     {
       title: 'BKH DHI',
       content: `La liste BKH DHI des perturbateurs endocriniens a été élaborée par l’Institut fédéral allemand d’évaluation des risques (BKH) en collaboration avec le Centre danois sur les perturbateurs endocriniens (DHI). Elle répertorie les substances susceptibles d’interférer avec le fonctionnement du système endocrinien.`
