@@ -35,7 +35,8 @@ EXCLUDED_COLUMNS = {
     "USEPA_PE": ["Chemical Name"],
     "ACGIH": ["Substance"],
     "OEHHA": ["Name"],
-    "AOEC_Asthmagens": ["Primary Name"]
+    "AOEC_Asthmagens": ["Primary Name"],
+    "CLP_Notifications": ["EC"]
 }
 
 SPECIAL_CARCINOGENICITY = {
@@ -53,13 +54,32 @@ SPECIAL_CARCINOGENICITY = {
     "OEHHA": lambda row: "cancer" in str(row.get("Toxicity", "")).lower(),
 }
 
+
 def normalize_cas(cas):
     if not isinstance(cas, str):
         return ""
     return cas.replace('–', '-').replace('—', '-').replace('‐', '-').replace('"', '').strip()
 
+
 def extract_cas_list(cell):
     return re.split(r'[;,\n/]', cell or '')
+
+
+def ensure_indexes():
+    """Création des index utiles (appelée au chargement du module)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        # Index pour accélérer la recherche dans CLP_Notifications
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_clp_notifications_cas ON CLP_Notifications (CAS)')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Erreur lors de la création de l'index sur CLP_Notifications.CAS :", e)
+
+
+# Création des index au démarrage
+ensure_indexes()
 
 
 @app.route('/api/toxicology', methods=['POST'])
@@ -117,6 +137,7 @@ def is_classified(value):
         '-', 'not classified', 'not classified (not applicable)', 'classification not possible', '', ','
     ]
 
+
 def get_substance_name(cursor, cas):
     for table in ["CLP", "GHS_Australia", "GHS_Japan", "GHS_Korea", "GHS_China"]:
         try:
@@ -130,6 +151,7 @@ def get_substance_name(cursor, cas):
         except:
             continue
     return None
+
 
 @app.route('/api/search', methods=['POST'])
 def search_classifications():
@@ -155,7 +177,14 @@ def search_classifications():
 
         for table in selected_tables:
             try:
-                rows = cursor.execute(f"SELECT * FROM {table}").fetchall()
+                if table == "CLP_Notifications":
+                    # Optimisation: requête ciblée grâce à l'index CAS
+                    rows = cursor.execute(
+                        'SELECT * FROM "CLP_Notifications" WHERE CAS = ?',
+                        (cas,)
+                    ).fetchall()
+                else:
+                    rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
             except Exception:
                 continue
 
@@ -225,13 +254,16 @@ def search_classifications():
     conn.close()
     return jsonify(result)
 
+
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
 
+
 @app.route('/<path:path>')
 def serve_static(path):
     return send_from_directory(app.static_folder, path)
+
 
 @app.route('/api/export/<fmt>', methods=['POST'])
 def export_classifications(fmt):
@@ -252,7 +284,7 @@ def export_classifications(fmt):
 
         for table in selected_tables:
             try:
-                rows = cursor.execute(f"SELECT * FROM {table}").fetchall()
+                rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
             except:
                 continue
             for row in rows:
@@ -281,15 +313,18 @@ def export_classifications(fmt):
         output = BytesIO()
         df.to_excel(output, index=False)
         output.seek(0)
-        return send_file(output, download_name="export.xlsx", as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        return send_file(output, download_name="export.xlsx", as_attachment=True,
+                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     elif fmt == 'csv':
         output = StringIO()
         df.to_csv(output, index=False)
         output.seek(0)
-        return send_file(BytesIO(output.getvalue().encode('utf-8')), download_name="export.csv", as_attachment=True, mimetype='text/csv')
+        return send_file(BytesIO(output.getvalue().encode('utf-8')), download_name="export.csv",
+                         as_attachment=True, mimetype='text/csv')
     else:
         return jsonify({"error": "Format not supported"}), 400
-        
+
+
 @app.route('/api/export/xlsx_split', methods=['POST'])
 def export_split_classifications():
     data = request.json
@@ -303,7 +338,7 @@ def export_split_classifications():
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         for table in selected_tables:
             try:
-                rows = cursor.execute(f"SELECT * FROM '{table}'").fetchall()
+                rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
             except:
                 continue
 
@@ -326,7 +361,7 @@ def export_split_classifications():
     output.seek(0)
     return send_file(output, download_name="export_classifications_par_table.xlsx", as_attachment=True,
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
- 
+
 
 @app.route('/api/vtr', methods=['POST'])
 def search_vtr():
@@ -389,6 +424,7 @@ def search_vtr():
     conn_names.close()
     return jsonify(result)
 
+
 @app.route('/api/vtr_export/xlsx', methods=['POST'])
 def export_vtr_xlsx():
     data = request.get_json()
@@ -422,6 +458,7 @@ def export_vtr_xlsx():
 
     return send_file(output, download_name="export_vtr.xlsx", as_attachment=True,
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
