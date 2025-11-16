@@ -6,6 +6,10 @@ function Documentation() {
       title: 'CLP',
       content: `La classification CLP, pour Classification, Labelling and Packaging (Classification, étiquetage et emballage), est un système utilisé dans l’Union européenne pour classer les substances chimiques selon leurs dangers et fournir des étiquettes et des fiches de données de sécurité normalisées.`
     },
+	{
+	  title: 'CLP Notifications',
+	  content: `La base CLP Notifications regroupe les classifications et étiquetages déclarés par les fabricants, importateurs et utilisateurs en aval dans le cadre du règlement CLP. Elle reflète les notifications soumises au niveau européen pour de nombreuses substances, notamment lorsqu’aucune classification harmonisée n’est établie.`
+	},
     {
       title: 'GHS Australia',
       content: `Le GHS Australia désigne l’adoption et la mise en œuvre du Système général harmonisé de classification et d’étiquetage des produits chimiques (GHS) dans le cadre réglementaire australien. Il aligne la classification et l’étiquetage des substances chimiques sur les normes internationales afin d’améliorer la sécurité lors de leur manipulation, de leur transport et de leur utilisation. Il combine des éléments du système CLP européen et de la classification GHS de la Nouvelle-Zélande.`
@@ -22,6 +26,22 @@ function Documentation() {
       title: 'GHS China',
       content: `Le GHS China fait référence à l’adoption du GHS en Chine, visant à harmoniser la classification et l’étiquetage des produits chimiques avec les normes internationales, pour garantir une manipulation, un transport et une utilisation plus sûrs.`
     },
+	{
+	  title: 'GHS Taiwan',
+	  content: `Le GHS Taiwan correspond à la mise en œuvre du Système général harmonisé (GHS) dans la réglementation taïwanaise, afin d’harmoniser la classification et l’étiquetage des substances chimiques avec les normes internationales et d’améliorer la sécurité lors de leur manipulation et utilisation.`
+	},
+	{
+	  title: 'GHS Malaysia',
+	  content: `Le GHS Malaysia désigne l’adoption du Système général harmonisé (GHS) par la Malaisie, unifiant la classification et l’étiquetage des produits chimiques pour renforcer la protection des travailleurs, des consommateurs et de l’environnement tout en assurant la cohérence avec les standards internationaux.`
+	},
+	{
+	  title: 'SIMDUT 2015',
+	  content: `Le SIMDUT 2015, transposition canadienne du Système général harmonisé (GHS), harmonise la classification, l’étiquetage et les fiches de données de sécurité des produits chimiques au Canada afin de mieux prévenir les risques dans les milieux professionnels.`
+	},
+	{
+	  title: 'ATSDR Hazards',
+	  content: `Les ATSDR Hazards sont issus de la rubrique "Health Effects of Exposure to Substances" de l’ATSDR. Ils rassemblent les effets sanitaires associés à l’exposition à diverses substances chimiques, organisés par systèmes d’organes et types d’effets, afin de faciliter l’identification des dangers pour la santé humaine.`
+	}
     {
       title: 'BKH DHI',
       content: `La liste BKH DHI des perturbateurs endocriniens a été élaborée par l’Institut fédéral allemand d’évaluation des risques (BKH) en collaboration avec le Centre danois sur les perturbateurs endocriniens (DHI). Elle répertorie les substances susceptibles d’interférer avec le fonctionnement du système endocrinien.`
