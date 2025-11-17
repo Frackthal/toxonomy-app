@@ -369,60 +369,77 @@ def search_vtr():
     cas_numbers = [normalize_cas(cas) for cas in data.get('cas_numbers', [])]
     result = {}
 
+    # Connexion à VTR.db (vtr_all)
     conn_vtr = sqlite3.connect('VTR.db')
     conn_vtr.row_factory = sqlite3.Row
     cursor_vtr = conn_vtr.cursor()
 
+    # On lit toute la table vtr_all une fois
+    try:
+        rows_all = cursor_vtr.execute('SELECT * FROM vtr_all').fetchall()
+        columns_all = [desc[0] for desc in cursor_vtr.description]
+    except Exception as e:
+        print(f"⚠️ Erreur lecture vtr_all : {e}")
+        conn_vtr.close()
+        return jsonify({"error": "Impossible de lire la table vtr_all"}), 500
+
+    # Connexion à Classifications.db pour le nom de substance
     conn_names = sqlite3.connect('Classifications.db')
     conn_names.row_factory = sqlite3.Row
     cursor_names = conn_names.cursor()
 
-    cursor_vtr.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [row['name'] for row in cursor_vtr.fetchall()]
-
     for cas in cas_numbers:
-        entry = {'substanceName': None, 'sources': [], 'details': {}}
+        entry = {
+            'substanceName': get_substance_name(cursor_names, cas),
+            'sources': [],
+            'details': {}
+        }
 
-        for table in ["CLP", "GHS_Australia", "GHS_Japan", "GHS_Korea", "GHS_China"]:
-            try:
-                cursor_names.execute(f'SELECT * FROM "{table}" WHERE CAS = ?', (cas,))
-                row = cursor_names.fetchone()
-                if row and 'Substance Name' in row.keys() and row['Substance Name'] not in ['-', 'not applicable', 'not classified']:
-                    entry['substanceName'] = row['Substance Name']
-                    break
-            except Exception:
-                continue
+        matching_rows = []
+        authorities = set()
 
-        for table in tables:
-            try:
-                rows = cursor_vtr.execute(f'SELECT * FROM "{table}"').fetchall()
-            except Exception as e:
-                print(f"⚠️ Erreur lecture table {table}: {e}")
-                continue
+        for row in rows_all:
+            # Attention: colonne 'cas' en minuscule dans vtr_all
+            raw_cas = str(row['cas']) if 'cas' in row.keys() else ''
+            all_cas = extract_cas_list(raw_cas)
+            if cas in [normalize_cas(c) for c in all_cas]:
+                matching_rows.append(row)
+                auth = row['authority']
+                if auth:
+                    authorities.add(str(auth))
 
-            matching_rows = []
-            for row in rows:
-                raw_cas = str(row['CAS'])
-                all_cas = extract_cas_list(raw_cas)
-                if cas in [normalize_cas(c) for c in all_cas]:
-                    matching_rows.append(dict(row))
+        if matching_rows:
+            # On masque id, source_system et raw_source côté API
+            visible_columns = [
+                c for c in columns_all
+                if c not in ('id', 'source_system', 'raw_source')
+            ]
 
-            if matching_rows:
-                columns = [description[0] for description in cursor_vtr.description]
-                entry['sources'].append(table.replace("_", " "))
-                entry['details'][table] = {
-                    "columns": columns,
-                    "rows": matching_rows
-                }
+            rows_list = []
+            for row in matching_rows:
+                d = {}
+                for col in visible_columns:
+                    d[col] = row[col]
+                rows_list.append(d)
 
-        if not entry['sources']:
-            entry['sources'].append('Introuvable')
+            # sources = autorités distinctes, sinon fallback
+            entry['sources'] = sorted(authorities) if authorities else ['Valeurs de référence']
+
+            # Une seule "table logique" pour l’UI
+            entry['details']['Valeurs de référence'] = {
+                "columns": visible_columns,
+                "rows": rows_list
+            }
+        else:
+            entry['sources'] = ['Introuvable']
 
         result[cas] = entry
 
     conn_vtr.close()
     conn_names.close()
     return jsonify(result)
+
+
 
 
 @app.route('/api/vtr_export/xlsx', methods=['POST'])
@@ -432,32 +449,40 @@ def export_vtr_xlsx():
 
     conn_vtr = sqlite3.connect('VTR.db')
     conn_vtr.row_factory = sqlite3.Row
-    cursor_vtr = conn_vtr.cursor()
 
-    cursor_vtr.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [row['name'] for row in cursor_vtr.fetchall()]
-
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        for table in tables:
-            try:
-                df = pd.read_sql_query(f'SELECT * FROM "{table}"', conn_vtr)
-            except Exception as e:
-                print(f"⚠️ Erreur lecture table {table}: {e}")
-                continue
-
-            df_filtered = df[df['CAS'].apply(lambda x: any(
-                normalize_cas(c) in cas_numbers for c in extract_cas_list(str(x))
-            ))]
-
-            if not df_filtered.empty:
-                df_filtered.to_excel(writer, sheet_name=table[:31], index=False)
+    try:
+        df = pd.read_sql_query('SELECT * FROM vtr_all', conn_vtr)
+    except Exception as e:
+        print(f"⚠️ Erreur lecture vtr_all : {e}")
+        conn_vtr.close()
+        return jsonify({"error": "Impossible de lire la table vtr_all"}), 500
 
     conn_vtr.close()
+
+    def cas_matches(cell):
+        all_cas = extract_cas_list(str(cell))
+        return any(normalize_cas(c) in cas_numbers for c in all_cas)
+
+    if 'cas' in df.columns:
+        df_filtered = df[df['cas'].apply(cas_matches)]
+    else:
+        df_filtered = df
+
+    for col in ['id', 'source_system', 'raw_source']:
+        if col in df_filtered.columns:
+            df_filtered = df_filtered.drop(columns=[col])
+
+    output = BytesIO()
+    df_filtered.to_excel(output, sheet_name='vtr_all', index=False)
     output.seek(0)
 
-    return send_file(output, download_name="export_vtr.xlsx", as_attachment=True,
-                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    return send_file(
+        output,
+        download_name="export_vtr.xlsx",
+        as_attachment=True,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
 
 
 if __name__ == '__main__':
