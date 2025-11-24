@@ -88,15 +88,40 @@ def extract_cas_list(raw_cas):
 def is_classified(value):
     if value is None:
         return False
+
+    # les nombres (catégories GHS, etc.) sont des classifications
     if isinstance(value, (int, float)):
         return True
+
     s = str(value).strip().lower()
     if s == "":
         return False
-    if s in ["-", "not classified", "not applicable", "nc"]:
+
+    # valeurs génériques qui signifient "pas classé" ou "pas évaluable"
+    NON_CLASSIFIED_EXACT = {
+        "-",
+        "nc",
+        "not classified",
+        "not applicable",
+        "classification not possible",
+        "no data available",
+    }
+
+    if s in NON_CLASSIFIED_EXACT:
         return False
+
+    # cas fréquents avec compléments entre parenthèses
+    if s.startswith("not classified"):
+        return False
+    if s.startswith("not applicable"):
+        return False
+    if s.startswith("classification not possible"):
+        return False
+
+    # expressions du type "no evidence of", "no classification"
     if s.startswith("no "):
         return False
+
     return True
 
 
