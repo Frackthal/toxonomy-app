@@ -30,8 +30,9 @@ EXCLUDED_COLUMNS = {
     "MAK_Carcinogens": ["Substance name"],
     "NTP_Carcinogens": ["NAME OR SYNONYM"],
     "SINList": ["EC Number", "Name", "Synonyms"],
-    "TEDX": ["Chemical Name", "Alternative Names"],
-    "USEPA_Carcinogens": ["CHEMICAL NAME"],
+    "TEDX": ["Chemical name"],
+    "USEPA_Carcinogens": ["CAS RN", "Substance name"],
+    "EU_EDlists": ["Substance Name"],
     "USEPA_PE": ["Chemical Name"],
     "ACGIH": ["Substance"],
     "OEHHA": ["Name"],
@@ -48,94 +49,55 @@ SPECIAL_CARCINOGENICITY = {
         "Not likely to be carcinogenic to humans",
         ""
     ],
-    "NTP_Carcinogens": lambda row: dict(row).get("Listing") and str(row["Listing"]).strip() != "",
-    "MAK_Carcinogens": lambda row: dict(row).get("Category") and str(row["Category"]).strip() != "",
-    "ACGIH": lambda row: any((x in str(row.get("Notation", "")).upper()) for x in ["A1", "A2", "A3"]),
-    "OEHHA": lambda row: "cancer" in str(row.get("Toxicity", "")).lower(),
+    "NTP_Carcinogens": lambda row: dict(row).get("Rationale and comments") and any(
+        phrase in str(row["Rationale and comments"])
+        for phrase in [
+            "known to be a human carcinogen",
+            "reasonably be anticipated to be a human carcinogen",
+            "carcinogenicity"
+        ]
+    ),
+    "MAK_Carcinogens": lambda row: dict(row).get("Carc.") and str(row["Carc."]).strip() not in ["", "5"]
 }
 
 
 def normalize_cas(cas):
-    if not isinstance(cas, str):
+    if not cas:
         return ""
-    return cas.replace('–', '-').replace('—', '-').replace('‐', '-').replace('"', '').strip()
+    cas = str(cas).strip()
+    cas = cas.replace(" ", "")
+    cas = cas.replace("CAS", "").replace("cas", "").replace("№", "").replace("No.", "")
+    match = re.search(r"(\d{2,7}-\d{2}-\d)", cas)
+    return match.group(1) if match else cas
 
 
-def extract_cas_list(cell):
-    return re.split(r'[;,\n/]', cell or '')
-
-
-def ensure_indexes():
-    """Création des index utiles (appelée au chargement du module)."""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        # Index pour accélérer la recherche dans CLP_Notifications
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_clp_notifications_cas ON CLP_Notifications (CAS)')
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print("Erreur lors de la création de l'index sur CLP_Notifications.CAS :", e)
-
-
-# Création des index au démarrage
-ensure_indexes()
-
-
-@app.route('/api/toxicology', methods=['POST'])
-def search_toxicology():
-    data = request.get_json()
-    cas_numbers = [normalize_cas(cas) for cas in data.get('cas_numbers', [])]
-    result = {}
-
-    # Connexion à Toxicology.db
-    conn = sqlite3.connect(os.path.join(os.path.dirname(__file__), 'Toxicology.db'))
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-
-    # Récupérer toutes les tables
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [row['name'] for row in cursor.fetchall()]
-
-    for cas in cas_numbers:
-        entry = {'sources': [], 'details': {}}
-        for table in tables:
-            try:
-                rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
-            except Exception:
-                continue
-
-            for row in rows:
-                raw_cas = str(row['CAS'])
-                all_cas = extract_cas_list(raw_cas)
-                if cas in [normalize_cas(c) for c in all_cas]:
-                    entry['sources'].append(table.replace("_", " "))
-                    # Suppression CAS et CID
-                    cols = [c for c in row.keys() if c.lower() not in ['cas', 'cid']]
-                    texte = ""
-                    for c in cols:
-                        val = str(row[c]).strip()
-                        if val and val.lower() not in ['-', 'not applicable', 'not classified']:
-                            texte += val
-                    entry['details'][table] = texte
-                    break
-
-        if not entry['sources']:
-            entry['sources'].append('Introuvable')
-
-        result[cas] = entry
-
-    conn.close()
-    return jsonify(result)
+def extract_cas_list(raw_cas):
+    if not raw_cas:
+        return []
+    text = str(raw_cas)
+    text = re.sub(r'CAS[: ]*', '', text, flags=re.IGNORECASE)
+    parts = re.split(r'[;,/]|\\n', text)
+    cas_list = []
+    for part in parts:
+        cas = normalize_cas(part)
+        if cas:
+            cas_list.append(cas)
+    return cas_list
 
 
 def is_classified(value):
-    if not value:
+    if value is None:
         return False
-    v = value.strip().lower()
-    return v not in [
-        '-', 'not classified', 'not classified (not applicable)', 'classification not possible', '', ','
-    ]
+    if isinstance(value, (int, float)):
+        return True
+    s = str(value).strip().lower()
+    if s == "":
+        return False
+    if s in ["-", "not classified", "not applicable", "nc"]:
+        return False
+    if s.startswith("no "):
+        return False
+    return True
 
 
 def get_substance_name(cursor, cas):
@@ -153,6 +115,29 @@ def get_substance_name(cursor, cas):
     return None
 
 
+def build_substance_name_index(cursor):
+    """
+    Construit un index CAS -> nom de substance en lisant une fois
+    les tables de reference (CLP et GHS principaux).
+    """
+    name_index = {}
+    priority_tables = ["CLP", "GHS_Australia", "GHS_Japan", "GHS_Korea", "GHS_China"]
+    for table in priority_tables:
+        try:
+            rows = cursor.execute(f'SELECT [Substance Name], CAS FROM "{table}"').fetchall()
+        except Exception:
+            continue
+        for row in rows:
+            raw_cas = str(row["CAS"])
+            all_cas = extract_cas_list(raw_cas)
+            for cas in [normalize_cas(c) for c in all_cas]:
+                if cas and cas not in name_index:
+                    name = row["Substance Name"]
+                    if name:
+                        name_index[cas] = name.strip()
+    return name_index
+
+
 @app.route('/api/search', methods=['POST'])
 def search_classifications():
     data = request.json
@@ -160,96 +145,118 @@ def search_classifications():
     selected_tables = data.get('classifications', [])
     result = {}
 
+    if not cas_numbers or not selected_tables:
+        return jsonify({})
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
+    # Index des noms de substances pour les CAS demandés
+    name_index = build_substance_name_index(cursor)
+
+    cas_set = set(cas_numbers)
+
+    # Initialisation des entrées résultat
     for cas in cas_numbers:
-        found = False
-        entry = {
+        result[cas] = {
             'CAS': cas,
-            'substanceName': get_substance_name(cursor, cas),
+            'substanceName': name_index.get(cas),
             'CMR': {},
             'PE_Sens': {},
             'sources': [],
             'details': {}
         }
 
-        for table in selected_tables:
-            try:
-                if table == "CLP_Notifications":
-                    # Optimisation: requête ciblée grâce à l'index CAS
-                    rows = cursor.execute(
-                        'SELECT * FROM "CLP_Notifications" WHERE CAS = ?',
-                        (cas,)
-                    ).fetchall()
-                else:
-                    rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
-            except Exception:
+    # Pour éviter de traiter plusieurs fois le même couple CAS/table
+    seen_tables = {cas: set() for cas in cas_numbers}
+
+    for table in selected_tables:
+        try:
+            rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
+        except Exception:
+            continue
+
+        excluded = EXCLUDED_COLUMNS.get(table, [])
+
+        for row in rows:
+            raw_cas = str(row['CAS'])
+            all_cas = extract_cas_list(raw_cas)
+            # CAS de la ligne qui nous intéressent
+            target_cas = [normalize_cas(c) for c in all_cas if normalize_cas(c) in cas_set]
+            if not target_cas:
                 continue
 
-            for row in rows:
-                raw_cas = str(row['CAS'])
-                all_cas = extract_cas_list(raw_cas)
-                if cas in [normalize_cas(c) for c in all_cas]:
-                    entry['sources'].append(table.replace('_', ' '))
-                    entry['details'][table] = {}
+            for cas in target_cas:
+                # Un seul enregistrement par table et par CAS
+                if table in seen_tables[cas]:
+                    continue
+                seen_tables[cas].add(table)
 
-                    for col in row.keys():
-                        val = row[col]
-                        if col in CMR_COLUMNS and is_classified(val):
-                            entry['CMR'][CMR_COLUMNS[col]] = True
+                entry = result[cas]
 
-                    if table in SPECIAL_CARCINOGENICITY:
-                        try:
-                            if SPECIAL_CARCINOGENICITY[table](dict(row)):
-                                entry['CMR']['Cancérogène'] = True
-                        except Exception:
-                            pass
+                pretty_table = table.replace('_', ' ')
+                if pretty_table not in entry['sources']:
+                    entry['sources'].append(pretty_table)
 
-                    # Ajout logique PE
-                    if table == 'BKH_DHI' and dict(row).get("Category") in ['CAT1', 'CAT2']:
-                        entry['PE_Sens']['PE'] = True
-                    if table == 'DEDuCT' and dict(row).get("Category") in ['I', 'II', 'III', 'IV']:
-                        entry['PE_Sens']['PE'] = True
-                    if table == 'EU_EDlists' and dict(row).get("List") in ['List I', 'List II', 'List III']:
-                        entry['PE_Sens']['PE'] = True
-                    if table == 'SINList' and 'endocrine disruptor' in str(dict(row).get("Health and environmental concern", '')).lower():
-                        entry['PE_Sens']['PE'] = True
-                    if table == 'TEDX':
-                        entry['PE_Sens']['PE'] = True
-                    if table == 'USEPA_PE':
-                        liste = str(dict(row).get("Liste", '')).strip()
-                        if liste not in ['Liste 1 (No evidence)', 'Liste 2']:
-                            entry['PE_Sens']['PE'] = True
+                entry['details'].setdefault(table, {})
 
-                    # Sens. Resp.
-                    if table in ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China']:
-                        if is_classified(dict(row).get("Respiratory sensitization")):
-                            entry['PE_Sens']['Sens. Resp.'] = True
-                    if table == 'MAK_Allergens' and dict(row).get("Designation") in ['(Sah)', '(Sa)']:
+                # CMR direct
+                for col in row.keys():
+                    val = row[col]
+                    if col in CMR_COLUMNS and is_classified(val):
+                        entry['CMR'][CMR_COLUMNS[col]] = True
+
+                # Cancers spécifiques (IARC, USEPA_Carcinogens, etc.)
+                if table in SPECIAL_CARCINOGENICITY:
+                    try:
+                        if SPECIAL_CARCINOGENICITY[table](dict(row)):
+                            entry['CMR']['Cancérogène'] = True
+                    except Exception:
+                        pass
+
+                # PE
+                if table == 'BKH_DHI' and dict(row).get("Category") in ['CAT1', 'CAT2']:
+                    entry['PE_Sens']['PE'] = True
+                if table == 'DEDuCT' and dict(row).get("Category") in ['I', 'II', 'III', 'IV']:
+                    entry['PE_Sens']['PE'] = True
+                if table == 'EU_EDlists' and dict(row).get("List") in ['List I', 'List II', 'List III']:
+                    entry['PE_Sens']['PE'] = True
+                if table == 'SINList' and 'endocrine disruptor' in str(
+                    dict(row).get("Health and environmental concern", '')
+                ).lower():
+                    entry['PE_Sens']['PE'] = True
+                if table == 'TEDX':
+                    entry['PE_Sens']['PE'] = True
+                if table == 'USEPA_PE':
+                    liste = str(dict(row).get("Liste", '')).strip()
+                    if liste not in ['Liste 1 (No evidence)', 'Liste 2']:
+                        entry['PE_Sens']['PE'] = True
+
+                # Sens. Resp.
+                if table in ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China']:
+                    if is_classified(dict(row).get("Respiratory sensitization")):
                         entry['PE_Sens']['Sens. Resp.'] = True
+                if table == 'MAK_Allergens' and dict(row).get("Designation") in ['(Sah)', '(Sa)']:
+                    entry['PE_Sens']['Sens. Resp.'] = True
 
-                    # Sens. Cut.
-                    if table in ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China']:
-                        if is_classified(dict(row).get("Skin sensitization")):
-                            entry['PE_Sens']['Sens. Cut.'] = True
-                    if table == 'MAK_Allergens' and dict(row).get("Designation") in ['(Sah)', '(Sh)']:
+                # Sens. Cut.
+                if table in ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China']:
+                    if is_classified(dict(row).get("Skin sensitization")):
                         entry['PE_Sens']['Sens. Cut.'] = True
+                if table == 'MAK_Allergens' and dict(row).get("Designation") in ['(Sah)', '(Sh)']:
+                    entry['PE_Sens']['Sens. Cut.'] = True
 
-                    excluded = EXCLUDED_COLUMNS.get(table, [])
-                    for col in row.keys():
-                        val = row[col]
-                        if col not in ['CAS', 'Substance Name'] and col not in excluded and is_classified(val):
-                            entry['details'][table][col] = val
+                # Détails
+                for col in row.keys():
+                    val = row[col]
+                    if col not in ['CAS', 'Substance Name'] and col not in excluded and is_classified(val):
+                        entry['details'][table][col] = val
 
-                    found = True
-                    break
-
-        if not found:
+    # Marquage des CAS introuvables
+    for cas, entry in result.items():
+        if not entry['sources']:
             entry['sources'] = ['Introuvable']
-
-        result[cas] = entry
 
     conn.close()
     return jsonify(result)
@@ -262,105 +269,127 @@ def index():
 
 @app.route('/<path:path>')
 def serve_static(path):
+    if path.startswith('api/'):
+        return jsonify({"error": "API route"}), 404
     return send_from_directory(app.static_folder, path)
 
 
-@app.route('/api/export/<fmt>', methods=['POST'])
-def export_classifications(fmt):
+@app.route('/api/export', methods=['POST'])
+def export_classifications():
     data = request.json
     cas_numbers = [normalize_cas(cas) for cas in data.get('cas_numbers', [])]
     selected_tables = data.get('classifications', [])
+    export_format = data.get('format', 'xlsx')
+
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    export_rows = []
-    all_columns = set()
-    name_priority = {}
+    all_rows = []
 
     for cas in cas_numbers:
-        row_data = {"CAS": cas, "Nom": get_substance_name(cursor, cas) or ""}
-        name_priority[cas] = row_data["Nom"]
+        entry = {
+            'CAS': cas,
+            'substanceName': get_substance_name(cursor, cas),
+            'sources': [],
+            'details': {}
+        }
 
         for table in selected_tables:
             try:
                 rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
-            except:
+            except Exception:
                 continue
+
             for row in rows:
                 raw_cas = str(row['CAS'])
                 all_cas = extract_cas_list(raw_cas)
                 if cas in [normalize_cas(c) for c in all_cas]:
-                    excluded = EXCLUDED_COLUMNS.get(table, [])
-                    for col in row.keys():
-                        if col not in ['CAS', 'Substance Name'] and col not in excluded:
-                            val = row[col]
-                            if is_classified(val):
-                                colname = f"{table}_{col}"
-                                row_data[colname] = val
-                                all_columns.add(colname)
+                    entry['sources'].append(table.replace("_", " "))
+                    cols = [c for c in row.keys() if c.lower() not in ['cas', 'cid']]
+                    texte = ""
+                    for c in cols:
+                        val = str(row[c]).strip()
+                        if val and val.lower() not in ['-', 'not applicable', 'not classified']:
+                            texte += val
+                    entry['details'][table] = texte
                     break
 
-        export_rows.append(row_data)
+        if not entry['sources']:
+            entry['sources'].append('Introuvable')
+
+        all_rows.append(entry)
 
     conn.close()
 
-    columns_order = ["CAS", "Nom"] + sorted(all_columns)
-    df = pd.DataFrame(export_rows)
-    df = df.reindex(columns=columns_order)
+    rows_for_df = []
+    for entry in all_rows:
+        for source, details in entry['details'].items():
+            rows_for_df.append({
+                "CAS": entry['CAS'],
+                "Substance Name": entry['substanceName'],
+                "Source": source,
+                "Details": details
+            })
+        if not entry['details']:
+            rows_for_df.append({
+                "CAS": entry['CAS'],
+                "Substance Name": entry['substanceName'],
+                "Source": ', '.join(entry['sources']),
+                "Details": ""
+            })
 
-    if fmt == 'xlsx':
+    df = pd.DataFrame(rows_for_df)
+
+    if export_format == 'xlsx':
         output = BytesIO()
-        df.to_excel(output, index=False)
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, sheet_name='Classifications', index=False)
         output.seek(0)
-        return send_file(output, download_name="export.xlsx", as_attachment=True,
-                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    elif fmt == 'csv':
+        return send_file(
+            output,
+            download_name="export_classifications.xlsx",
+            as_attachment=True,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+    elif export_format == 'csv':
         output = StringIO()
         df.to_csv(output, index=False)
         output.seek(0)
-        return send_file(BytesIO(output.getvalue().encode('utf-8')), download_name="export.csv",
-                         as_attachment=True, mimetype='text/csv')
+        return send_file(
+            BytesIO(output.getvalue().encode('utf-8')),
+            download_name="export_classifications.csv",
+            as_attachment=True,
+            mimetype='text/csv'
+        )
+    elif export_format == 'txt':
+        output = StringIO()
+        df.to_csv(output, index=False, sep='\t')
+        output.seek(0)
+        return send_file(
+            BytesIO(output.getvalue().encode('utf-8')),
+            download_name="export_classifications.txt",
+            as_attachment=True,
+            mimetype='text/plain'
+        )
     else:
-        return jsonify({"error": "Format not supported"}), 400
+        return jsonify({"error": "Format non supporté"}), 400
 
 
-@app.route('/api/export/xlsx_split', methods=['POST'])
-def export_split_classifications():
-    data = request.json
-    cas_numbers = [normalize_cas(cas) for cas in data.get('cas_numbers', [])]
-    selected_tables = data.get('classifications', [])
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+def ensure_indexes():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        # Index pour accélérer la recherche dans CLP_Notifications
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_clp_notifications_cas ON CLP_Notifications (CAS)')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Erreur lors de la création de l'index sur CLP_Notifications.CAS :", e)
 
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        for table in selected_tables:
-            try:
-                rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
-            except:
-                continue
 
-            filtered = []
-            for row in rows:
-                raw_cas = str(row['CAS'])
-                all_cas = extract_cas_list(raw_cas)
-                if any(normalize_cas(c) in cas_numbers for c in all_cas):
-                    d = dict(row)
-                    # Supprimer colonnes exclues
-                    for col in EXCLUDED_COLUMNS.get(table, []):
-                        d.pop(col, None)
-                    filtered.append(d)
-
-            if filtered:
-                df = pd.DataFrame(filtered)
-                df.to_excel(writer, sheet_name=table[:31], index=False)
-
-    conn.close()
-    output.seek(0)
-    return send_file(output, download_name="export_classifications_par_table.xlsx", as_attachment=True,
-                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+# Création des index au démarrage
+ensure_indexes()
 
 
 @app.route('/api/vtr', methods=['POST'])
@@ -379,7 +408,7 @@ def search_vtr():
         rows_all = cursor_vtr.execute('SELECT * FROM vtr_all').fetchall()
         columns_all = [desc[0] for desc in cursor_vtr.description]
     except Exception as e:
-        print(f"⚠️ Erreur lecture vtr_all : {e}")
+        print(f"Erreur lecture vtr_all : {e}")
         conn_vtr.close()
         return jsonify({"error": "Impossible de lire la table vtr_all"}), 500
 
@@ -415,20 +444,15 @@ def search_vtr():
                 if c not in ('id', 'source_system', 'raw_source')
             ]
 
-            rows_list = []
-            for row in matching_rows:
-                d = {}
-                for col in visible_columns:
-                    d[col] = row[col]
-                rows_list.append(d)
-
-            # sources = autorités distinctes, sinon fallback
-            entry['sources'] = sorted(authorities) if authorities else ['Valeurs de référence']
-
-            # Une seule "table logique" pour l’UI
-            entry['details']['Valeurs de référence'] = {
-                "columns": visible_columns,
-                "rows": rows_list
+            entry['sources'] = sorted(list(authorities)) if authorities else []
+            entry['details'] = {
+                'vtr_all': {
+                    'columns': visible_columns,
+                    'rows': [
+                        {col: r[col] for col in visible_columns}
+                        for r in matching_rows
+                    ]
+                }
             }
         else:
             entry['sources'] = ['Introuvable']
@@ -440,8 +464,6 @@ def search_vtr():
     return jsonify(result)
 
 
-
-
 @app.route('/api/vtr_export/xlsx', methods=['POST'])
 def export_vtr_xlsx():
     data = request.get_json()
@@ -449,28 +471,18 @@ def export_vtr_xlsx():
 
     conn_vtr = sqlite3.connect('VTR.db')
     conn_vtr.row_factory = sqlite3.Row
+    cursor_vtr = conn_vtr.cursor()
+    df = pd.read_sql_query("SELECT * FROM vtr_all", conn_vtr)
 
-    try:
-        df = pd.read_sql_query('SELECT * FROM vtr_all', conn_vtr)
-    except Exception as e:
-        print(f"⚠️ Erreur lecture vtr_all : {e}")
-        conn_vtr.close()
-        return jsonify({"error": "Impossible de lire la table vtr_all"}), 500
+    # On filtre sur les CAS demandés
+    df_filtered = df[df['cas'].apply(
+        lambda raw: any(
+            normalize_cas(c) in cas_numbers
+            for c in extract_cas_list(raw)
+        )
+    )]
 
     conn_vtr.close()
-
-    def cas_matches(cell):
-        all_cas = extract_cas_list(str(cell))
-        return any(normalize_cas(c) in cas_numbers for c in all_cas)
-
-    if 'cas' in df.columns:
-        df_filtered = df[df['cas'].apply(cas_matches)]
-    else:
-        df_filtered = df
-
-    for col in ['id', 'source_system', 'raw_source']:
-        if col in df_filtered.columns:
-            df_filtered = df_filtered.drop(columns=[col])
 
     output = BytesIO()
     df_filtered.to_excel(output, sheet_name='vtr_all', index=False)
@@ -484,6 +496,6 @@ def export_vtr_xlsx():
     )
 
 
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
+
