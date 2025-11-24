@@ -101,16 +101,19 @@ def is_classified(value):
 
 
 def get_substance_name(cursor, cas):
+    """
+    Version plus légère qui itère sur les lignes sans faire de fetchall.
+    Utilisée surtout pour les exports et la page VTR.
+    """
     for table in ["CLP", "GHS_Australia", "GHS_Japan", "GHS_Korea", "GHS_China"]:
         try:
-            rows = cursor.execute(f"SELECT [Substance Name], CAS FROM {table}").fetchall()
-            for row in rows:
+            for row in cursor.execute(f'SELECT [Substance Name], CAS FROM "{table}"'):
                 all_cas = extract_cas_list(row["CAS"])
                 if cas in [normalize_cas(c) for c in all_cas]:
                     name = row["Substance Name"]
                     if name:
                         return name.strip()
-        except:
+        except Exception:
             continue
     return None
 
@@ -118,23 +121,22 @@ def get_substance_name(cursor, cas):
 def build_substance_name_index(cursor):
     """
     Construit un index CAS -> nom de substance en lisant une fois
-    les tables de reference (CLP et GHS principaux).
+    les tables de reference, en streaming (sans fetchall).
     """
     name_index = {}
     priority_tables = ["CLP", "GHS_Australia", "GHS_Japan", "GHS_Korea", "GHS_China"]
     for table in priority_tables:
         try:
-            rows = cursor.execute(f'SELECT [Substance Name], CAS FROM "{table}"').fetchall()
+            for row in cursor.execute(f'SELECT [Substance Name], CAS FROM "{table}"'):
+                raw_cas = str(row["CAS"])
+                all_cas = extract_cas_list(raw_cas)
+                for cas in [normalize_cas(c) for c in all_cas]:
+                    if cas and cas not in name_index:
+                        name = row["Substance Name"]
+                        if name:
+                            name_index[cas] = name.strip()
         except Exception:
             continue
-        for row in rows:
-            raw_cas = str(row["CAS"])
-            all_cas = extract_cas_list(raw_cas)
-            for cas in [normalize_cas(c) for c in all_cas]:
-                if cas and cas not in name_index:
-                    name = row["Substance Name"]
-                    if name:
-                        name_index[cas] = name.strip()
     return name_index
 
 
@@ -168,18 +170,32 @@ def search_classifications():
             'details': {}
         }
 
-    # Pour éviter de traiter plusieurs fois le même couple CAS/table
+    # Pour éviter de traiter plusieurs fois le même couple CAS / table
     seen_tables = {cas: set() for cas in cas_numbers}
 
     for table in selected_tables:
-        try:
-            rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
-        except Exception:
-            continue
-
         excluded = EXCLUDED_COLUMNS.get(table, [])
 
-        for row in rows:
+        # Cas particulier pour CLP_Notifications qui est massif
+        if table == "CLP_Notifications":
+            if not cas_numbers:
+                continue
+            placeholders = ",".join("?" for _ in cas_numbers)
+            try:
+                rows_iter = cursor.execute(
+                    f'SELECT * FROM "{table}" WHERE CAS IN ({placeholders})',
+                    cas_numbers
+                )
+            except Exception:
+                continue
+        else:
+            # Streaming sur la table sans fetchall
+            try:
+                rows_iter = cursor.execute(f'SELECT * FROM "{table}"')
+            except Exception:
+                continue
+
+        for row in rows_iter:
             raw_cas = str(row['CAS'])
             all_cas = extract_cas_list(raw_cas)
             # CAS de la ligne qui nous intéressent
@@ -216,35 +232,36 @@ def search_classifications():
                         pass
 
                 # PE
-                if table == 'BKH_DHI' and dict(row).get("Category") in ['CAT1', 'CAT2']:
+                row_dict = dict(row)
+                if table == 'BKH_DHI' and row_dict.get("Category") in ['CAT1', 'CAT2']:
                     entry['PE_Sens']['PE'] = True
-                if table == 'DEDuCT' and dict(row).get("Category") in ['I', 'II', 'III', 'IV']:
+                if table == 'DEDuCT' and row_dict.get("Category") in ['I', 'II', 'III', 'IV']:
                     entry['PE_Sens']['PE'] = True
-                if table == 'EU_EDlists' and dict(row).get("List") in ['List I', 'List II', 'List III']:
+                if table == 'EU_EDlists' and row_dict.get("List") in ['List I', 'List II', 'List III']:
                     entry['PE_Sens']['PE'] = True
                 if table == 'SINList' and 'endocrine disruptor' in str(
-                    dict(row).get("Health and environmental concern", '')
+                    row_dict.get("Health and environmental concern", '')
                 ).lower():
                     entry['PE_Sens']['PE'] = True
                 if table == 'TEDX':
                     entry['PE_Sens']['PE'] = True
                 if table == 'USEPA_PE':
-                    liste = str(dict(row).get("Liste", '')).strip()
+                    liste = str(row_dict.get("Liste", '')).strip()
                     if liste not in ['Liste 1 (No evidence)', 'Liste 2']:
                         entry['PE_Sens']['PE'] = True
 
                 # Sens. Resp.
                 if table in ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China']:
-                    if is_classified(dict(row).get("Respiratory sensitization")):
+                    if is_classified(row_dict.get("Respiratory sensitization")):
                         entry['PE_Sens']['Sens. Resp.'] = True
-                if table == 'MAK_Allergens' and dict(row).get("Designation") in ['(Sah)', '(Sa)']:
+                if table == 'MAK_Allergens' and row_dict.get("Designation") in ['(Sah)', '(Sa)']:
                     entry['PE_Sens']['Sens. Resp.'] = True
 
                 # Sens. Cut.
                 if table in ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China']:
-                    if is_classified(dict(row).get("Skin sensitization")):
+                    if is_classified(row_dict.get("Skin sensitization")):
                         entry['PE_Sens']['Sens. Cut.'] = True
-                if table == 'MAK_Allergens' and dict(row).get("Designation") in ['(Sah)', '(Sh)']:
+                if table == 'MAK_Allergens' and row_dict.get("Designation") in ['(Sah)', '(Sh)']:
                     entry['PE_Sens']['Sens. Cut.'] = True
 
                 # Détails
@@ -297,11 +314,11 @@ def export_classifications():
 
         for table in selected_tables:
             try:
-                rows = cursor.execute(f'SELECT * FROM "{table}"').fetchall()
+                rows_iter = cursor.execute(f'SELECT * FROM "{table}"')
             except Exception:
                 continue
 
-            for row in rows:
+            for row in rows_iter:
                 raw_cas = str(row['CAS'])
                 all_cas = extract_cas_list(raw_cas)
                 if cas in [normalize_cas(c) for c in all_cas]:
@@ -385,7 +402,7 @@ def ensure_indexes():
         conn.commit()
         conn.close()
     except Exception as e:
-        print("Erreur lors de la création de l'index sur CLP_Notifications.CAS :", e)
+        print("Erreur lors de la création de l index sur CLP_Notifications.CAS :", e)
 
 
 # Création des index au démarrage
@@ -498,4 +515,3 @@ def export_vtr_xlsx():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
-
