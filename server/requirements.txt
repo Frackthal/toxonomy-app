@@ -1,7 +1,0 @@
-flask
-flask-cors
-gunicorn
-pandas
-openpyxl
-xlsxwriter
-boto3
