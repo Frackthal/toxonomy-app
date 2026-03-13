@@ -1,0 +1,74 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --surface-0:   #ffffff;
+  --surface-50:  #fafaf9;
+  --surface-100: #f5f5f4;
+  --surface-200: #e7e5e4;
+  --surface-300: #d6d3d1;
+  --surface-400: #a8a29e;
+  --surface-500: #78716c;
+  --surface-600: #57534e;
+  --surface-700: #44403c;
+  --surface-800: #292524;
+  --surface-900: #1c1917;
+  --text-primary: #1c1917;
+  --text-secondary: #57534e;
+  --text-tertiary: #a8a29e;
+  --border-color: #e7e5e4;
+  --border-subtle: #f5f5f4;
+  --accent: #0d7a3a;
+  --accent-light: #dcfce9;
+}
+
+.dark {
+  --surface-0:   #18181b;
+  --surface-50:  #1e1e22;
+  --surface-100: #27272a;
+  --surface-200: #3f3f46;
+  --surface-300: #52525b;
+  --surface-400: #71717a;
+  --surface-500: #a1a1aa;
+  --surface-600: #d4d4d8;
+  --surface-700: #e4e4e7;
+  --surface-800: #f4f4f5;
+  --surface-900: #fafafa;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #71717a;
+  --border-color: #3f3f46;
+  --border-subtle: #27272a;
+  --accent: #4ade7f;
+  --accent-light: #052e16;
+}
+
+body {
+  font-family: 'DM Sans', system-ui, sans-serif;
+  background: var(--surface-50);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-300); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--surface-400); }
+
+/* Transitions */
+* { transition-property: background-color, border-color, color, opacity;
+    transition-duration: 150ms;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); }
+
+/* Custom selections */
+::selection { background: var(--accent-light); color: var(--accent); }
+
+/* Badge base */
+.badge {
+  @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-medium tracking-wide;
+}
