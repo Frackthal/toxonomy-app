@@ -1,11 +1,10 @@
-
 /*
 toxProfile.js
 Optimized toxicological profile generator
 
 Key improvements:
 1. Uses OpenRouter (single API endpoint for multiple models)
-2. 2‑step LLM pipeline:
+2. 2-step LLM pipeline:
       - Step 1: extract structured notes from sources
       - Step 2: generate final toxicological profile
 3. HSDB filtering to reduce prompt size
@@ -26,7 +25,6 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 const SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost";
 const APP_NAME = process.env.OPENROUTER_APP_NAME || "Toxonomy";
-
 
 /* -----------------------------
    Utility: JSON extraction
@@ -53,19 +51,15 @@ function extractJSON(text) {
   }
 }
 
-
 /* -----------------------------
    OpenRouter call
 ------------------------------*/
 
 async function callLLM(prompt, modelList = []) {
-
   const models = [OPENROUTER_MODEL, ...modelList, ...OPENROUTER_FALLBACK_MODELS];
 
   for (const model of models) {
-
     try {
-
       const res = await fetch(OPENROUTER_URL, {
         method: "POST",
         headers: {
@@ -89,20 +83,18 @@ async function callLLM(prompt, modelList = []) {
 
       if (!res.ok) {
         const txt = await res.text();
-        console.error("OpenRouter error:", txt.slice(0,200));
+        console.error("OpenRouter error:", txt.slice(0, 200));
         continue;
       }
 
       const data = await res.json();
       const text = data?.choices?.[0]?.message?.content;
-
       const json = extractJSON(text);
 
       if (json) {
         json._model = model;
         return json;
       }
-
     } catch (err) {
       console.error("LLM error:", err.message);
     }
@@ -110,8 +102,6 @@ async function callLLM(prompt, modelList = []) {
 
   throw new Error("All LLM models failed");
 }
-
-
 
 /* -----------------------------
    HSDB filtering
@@ -139,59 +129,42 @@ const HSDB_KEYWORDS = [
 ];
 
 function filterHSDB(text) {
-
   if (!text) return "";
 
   const paragraphs = text.split(/\n\s*\n/);
 
-  const kept = paragraphs.filter(p => {
-
+  const kept = paragraphs.filter((p) => {
     const lower = p.toLowerCase();
-
-    return HSDB_KEYWORDS.some(k => lower.includes(k));
+    return HSDB_KEYWORDS.some((k) => lower.includes(k));
   });
 
-  return kept.join("\n\n").slice(0, 20000); // safety cap
+  return kept.join("\n\n").slice(0, 20000);
 }
-
-
 
 /* -----------------------------
    Source retrieval
 ------------------------------*/
 
 async function fetchPubChem(cas) {
-
   const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(cas)}/JSON`;
-
   const res = await fetch(url);
-
   if (!res.ok) return null;
-
   return res.text();
 }
-
 
 async function fetchHSDB(cas) {
-
   const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${encodeURIComponent(cas)}/JSON?heading=HSDB`;
-
   const res = await fetch(url);
-
   if (!res.ok) return null;
-
   return res.text();
 }
-
-
 
 /* -----------------------------
    Prompt builders
 ------------------------------*/
 
 function buildExtractionPrompt(substance, pubchem, hsdb) {
-
-return `
+  return `
 You are a toxicologist.
 
 Extract structured toxicological notes for the substance ${substance}.
@@ -221,13 +194,10 @@ ${pubchem}
 HSDB
 ${hsdb}
 `;
-
 }
 
-
 function buildSynthesisPrompt(substance, notes) {
-
-return `
+  return `
 You are a regulatory toxicologist.
 
 Using the structured notes below, generate a toxicological profile similar to an ECHA toxicological summary.
@@ -252,17 +222,13 @@ Return JSON with structured paragraphs.
 Notes:
 ${JSON.stringify(notes)}
 `;
-
 }
-
-
 
 /* -----------------------------
    Main pipeline
 ------------------------------*/
 
 export async function generateToxProfile(substance, cas) {
-
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY missing");
   }
@@ -297,21 +263,17 @@ export async function generateToxProfile(substance, cas) {
   };
 }
 
-
-
 /* -----------------------------
    CLI test
 ------------------------------*/
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-
   const substance = process.argv[2] || "Benzene";
   const cas = process.argv[3] || "71-43-2";
 
   generateToxProfile(substance, cas)
-    .then(r => console.log(JSON.stringify(r,null,2)))
-    .catch(e => console.error(e));
-
+    .then((r) => console.log(JSON.stringify(r, null, 2)))
+    .catch((e) => console.error(e));
 }
 
 /* -----------------------------
@@ -323,3 +285,4 @@ export function getCacheStats() {
     enabled: false,
     entries: 0
   };
+}
