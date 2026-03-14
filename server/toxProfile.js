@@ -249,7 +249,7 @@ async function callGemini(prompt) {
   const body = {
     contents: [{ parts: [{ text: prompt }] }],
     generationConfig: {
-      temperature: 0.1, // très factuel
+      temperature: 0.1,
       maxOutputTokens: 4096,
     },
   };
@@ -269,13 +269,20 @@ async function callGemini(prompt) {
   const data = await res.json();
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-  // Nettoyer les éventuelles balises markdown
-  const clean = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+  // Extraction robuste du JSON — cherche la première { et la dernière }
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  
+  if (firstBrace === -1 || lastBrace === -1) {
+    throw new Error(`Réponse Gemini sans JSON détectable : ${text.substring(0, 200)}`);
+  }
+
+  const jsonStr = text.slice(firstBrace, lastBrace + 1);
 
   try {
-    return JSON.parse(clean);
+    return JSON.parse(jsonStr);
   } catch (e) {
-    throw new Error(`Réponse Gemini non parseable : ${clean.substring(0, 300)}`);
+    throw new Error(`Réponse Gemini non parseable : ${jsonStr.substring(0, 300)}`);
   }
 }
 
