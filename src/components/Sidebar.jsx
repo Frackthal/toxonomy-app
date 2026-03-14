@@ -1,10 +1,13 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
 import { ListTree, BookOpen, HelpCircle, X, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { FlaskConical } from 'lucide-react';
+
 
 const navItems = [
   { to: '/', icon: ListTree, label: 'Classifications' },
   { to: '/vtr', icon: BookOpen, label: 'Valeurs de référence' },
+  { to: '/tox-profile', icon: FlaskConical, label: 'Profils toxicologiques' },
   { to: '/documentation', icon: HelpCircle, label: 'Documentation' },
 ];
 
