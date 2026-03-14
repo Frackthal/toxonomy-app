@@ -5,11 +5,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createWriteStream, existsSync } from 'fs';
 import { pipeline } from 'stream/promises';
 import ExcelJS from 'exceljs';
 import { generateToxProfile, getCacheStats } from './toxProfile.js';
-
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
@@ -114,20 +113,19 @@ const SPECIAL_CARCINOGENICITY = {
   MAK_Carcinogens: (r) => r['Carc.'] && !['', '5'].includes(String(r['Carc.']).trim()),
 };
 
-// ─── Index building ───────────────────────────────────────────────────────────
+// ─── Index building — iterate() au lieu de .all() pour économiser la RAM ──────
 function buildCasIndex(db) {
   console.log('Building CAS index…');
   const tables = FLAT_OPTIONS.map(o => o.value);
-  // Map: normalized CAS → { tableName → [rowid, …] }
   const index = new Map();
   const nameIndex = new Map();
-
   const nameTables = ['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China'];
 
   for (const table of tables) {
     try {
-      const rows = db.prepare(`SELECT rowid, * FROM "${table}"`).all();
-      for (const row of rows) {
+      // ✅ .iterate() = curseur SQLite, une ligne à la fois, pas de chargement massif en RAM
+      const stmt = db.prepare(`SELECT rowid, CAS, "Substance Name" FROM "${table}"`);
+      for (const row of stmt.iterate()) {
         const allCas = extractCasList(row.CAS);
         for (const cas of allCas) {
           const n = normalizeCas(cas);
@@ -137,7 +135,6 @@ function buildCasIndex(db) {
           if (!entry[table]) entry[table] = [];
           entry[table].push(row.rowid);
 
-          // Name index
           if (nameTables.includes(table) && !nameIndex.has(n)) {
             const name = row['Substance Name'];
             if (name) nameIndex.set(n, String(name).trim());
@@ -145,7 +142,7 @@ function buildCasIndex(db) {
         }
       }
     } catch (e) {
-      // Table might not exist
+      // Table might not exist or missing CAS column — skip silently
     }
   }
 
@@ -154,7 +151,6 @@ function buildCasIndex(db) {
 }
 
 function buildNameSearchIndex(nameIndex) {
-  // Array of { cas, nameLower } for substring search
   const arr = [];
   for (const [cas, name] of nameIndex.entries()) {
     arr.push({ cas, name, nameLower: name.toLowerCase() });
@@ -162,16 +158,40 @@ function buildNameSearchIndex(nameIndex) {
   return arr;
 }
 
+// ─── VTR helpers — éviter de charger toute la table en RAM ───────────────────
+// Prépare un index CAS → rowids pour vtr_all au démarrage
+function buildVtrIndex(db) {
+  console.log('Building VTR index…');
+  const index = new Map(); // normalized CAS → [rowid, …]
+  let columns = [];
+  try {
+    const stmt = db.prepare('SELECT rowid, cas FROM vtr_all');
+    columns = db.prepare('SELECT * FROM vtr_all LIMIT 0').columns().map(c => c.name);
+    for (const row of stmt.iterate()) {
+      const allCas = extractCasList(String(row.cas || ''));
+      for (const cas of allCas) {
+        const n = normalizeCas(cas);
+        if (!n) continue;
+        if (!index.has(n)) index.set(n, []);
+        index.get(n).push(row.rowid);
+      }
+    }
+  } catch (e) {
+    console.warn('VTR index build failed:', e.message);
+  }
+  console.log(`VTR index built: ${index.size} unique CAS numbers`);
+  return { index, columns };
+}
+
 // ─── Server startup ───────────────────────────────────────────────────────────
 async function main() {
-  // Download DBs
   await downloadDB('Classifications.db');
   await downloadDB('VTR.db');
 
   const classDbPath = path.join(DATA_DIR, 'Classifications.db');
   const vtrDbPath = path.join(DATA_DIR, 'VTR.db');
 
-  // Step 1: Open writable to create indexes, then close
+  // Step 1: Create SQL indexes (writable), then close
   const writeDb = new Database(classDbPath);
   writeDb.pragma('journal_mode = WAL');
   const tables = FLAT_OPTIONS.map(o => o.value);
@@ -183,14 +203,16 @@ async function main() {
   writeDb.close();
   console.log('Indexes created.');
 
-  // Step 2: Open readonly for serving
+  // Step 2: Open readonly
   const classDb = new Database(classDbPath, { readonly: true });
-  classDb.pragma('cache_size = -64000'); // 64MB read cache
+  classDb.pragma('cache_size = -32000'); // 32MB (réduit vs 64MB pour laisser de la marge)
   const vtrDb = new Database(vtrDbPath, { readonly: true });
 
-  // Build in-memory CAS index
+  // Build in-memory indexes (curseur, pas .all())
   const { index: casIndex, nameIndex } = buildCasIndex(classDb);
   const nameSearchArr = buildNameSearchIndex(nameIndex);
+  const { index: vtrIndex, columns: vtrAllColumns } = buildVtrIndex(vtrDb);
+  const vtrVisibleColumns = vtrAllColumns.filter(c => !['id', 'source_system', 'raw_source'].includes(c));
 
   const app = express();
   app.use(cors({ origin: '*' }));
@@ -249,7 +271,6 @@ async function main() {
         const prettyTable = table.replace(/_/g, ' ');
         if (!entry.sources.includes(prettyTable)) entry.sources.push(prettyTable);
 
-        // Get first matching row by rowid
         const rowid = rowids[0];
         let row;
         try {
@@ -257,19 +278,16 @@ async function main() {
         } catch (e) { continue; }
         if (!row) continue;
 
-        // CMR from CLP columns
         for (const [col, key] of Object.entries(CMR_COLUMNS)) {
           if (row[col] !== undefined && isClassified(row[col])) {
             entry.CMR[key] = true;
           }
         }
 
-        // Special carcinogenicity
         if (SPECIAL_CARCINOGENICITY[table]) {
           try { if (SPECIAL_CARCINOGENICITY[table](row)) entry.CMR.carcinogen = true; } catch (e) {}
         }
 
-        // PE
         if (table === 'BKH_DHI' && ['CAT1', 'CAT2'].includes(row.Category)) entry.PE_Sens.ed = true;
         if (table === 'DEDuCT' && ['I', 'II', 'III', 'IV'].includes(row.Category)) entry.PE_Sens.ed = true;
         if (table === 'EU_EDlists' && ['List I', 'List II', 'List III'].includes(row.List)) entry.PE_Sens.ed = true;
@@ -280,7 +298,6 @@ async function main() {
           if (!['Liste 1 (No evidence)', 'Liste 2'].includes(l)) entry.PE_Sens.ed = true;
         }
 
-        // Sensitization
         const ghsTables = ['CLP', 'GHS_Japan', 'GHS_Korea', 'GHS_Australia', 'GHS_China'];
         if (ghsTables.includes(table)) {
           if (isClassified(row['Respiratory sensitization'])) entry.PE_Sens.resp_sens = true;
@@ -291,7 +308,6 @@ async function main() {
           if (['(Sah)', '(Sh)'].includes(row.Designation)) entry.PE_Sens.skin_sens = true;
         }
 
-        // Details
         entry.details[table] = {};
         for (const col of Object.keys(row)) {
           if (col === 'CAS' || col === 'Substance Name' || excluded.has(col)) continue;
@@ -308,22 +324,11 @@ async function main() {
     res.json(result);
   });
 
-  // ─── API: VTR search ──────────────────────────────────────────────────────
+  // ─── API: VTR search — via index, pas .all() ──────────────────────────────
   app.post('/api/vtr', (req, res) => {
     const { cas_numbers = [] } = req.body;
     const casList = cas_numbers.map(normalizeCas).filter(Boolean);
     const result = {};
-
-    let allRows, columns;
-    try {
-      const stmt = vtrDb.prepare('SELECT * FROM vtr_all');
-      allRows = stmt.all();
-      columns = stmt.columns().map(c => c.name);
-    } catch (e) {
-      return res.status(500).json({ error: 'Cannot read vtr_all' });
-    }
-
-    const visibleColumns = columns.filter(c => !['id', 'source_system', 'raw_source'].includes(c));
 
     for (const cas of casList) {
       const entry = {
@@ -332,33 +337,35 @@ async function main() {
         details: {},
       };
 
+      const rowids = vtrIndex.get(cas);
+      if (!rowids?.length) {
+        entry.sources = ['Introuvable'];
+        result[cas] = entry;
+        continue;
+      }
+
       const matching = [];
       const authorities = new Set();
+      const stmt = vtrDb.prepare(`SELECT * FROM vtr_all WHERE rowid = ?`);
 
-      for (const row of allRows) {
-        const rawCas = String(row.cas || '');
-        const allCas = extractCasList(rawCas);
-        if (allCas.some(c => normalizeCas(c) === cas)) {
-          matching.push(row);
-          if (row.authority) authorities.add(String(row.authority));
-        }
+      for (const rowid of rowids) {
+        const row = stmt.get(rowid);
+        if (!row) continue;
+        matching.push(row);
+        if (row.authority) authorities.add(String(row.authority));
       }
 
-      if (matching.length) {
-        entry.sources = [...authorities].sort();
-        entry.details = {
-          vtr_all: {
-            columns: visibleColumns,
-            rows: matching.map(r => {
-              const obj = {};
-              for (const c of visibleColumns) obj[c] = r[c];
-              return obj;
-            }),
-          },
-        };
-      } else {
-        entry.sources = ['Introuvable'];
-      }
+      entry.sources = [...authorities].sort();
+      entry.details = {
+        vtr_all: {
+          columns: vtrVisibleColumns,
+          rows: matching.map(r => {
+            const obj = {};
+            for (const c of vtrVisibleColumns) obj[c] = r[c];
+            return obj;
+          }),
+        },
+      };
 
       result[cas] = entry;
     }
@@ -409,7 +416,6 @@ async function main() {
       return res.send(header + csv);
     }
 
-    // XLSX
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Classifications');
     ws.columns = [
@@ -419,8 +425,6 @@ async function main() {
       { header: 'Details', key: 'Details', width: 60 },
     ];
     for (const r of rows) ws.addRow(r);
-    // Style header
-    ws.getRow(1).font = { bold: true };
     ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1B4F72' } };
     ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
 
@@ -456,7 +460,6 @@ async function main() {
           try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowid); } catch { continue; }
           if (!row) continue;
           if (!allColumns) allColumns = Object.keys(row).filter(c => c !== 'rowid');
-          // Inject substance name if not already present
           const enriched = { CAS: cas, 'Substance Name': nameIndex.get(cas) || row['Substance Name'] || '', ...row };
           sheetRows.push(enriched);
         }
@@ -482,7 +485,6 @@ async function main() {
     }
 
     if (wb.worksheets.length === 0) {
-      // Add empty sheet to avoid corrupt file
       wb.addWorksheet('Aucun résultat');
     }
 
@@ -499,9 +501,7 @@ async function main() {
     const selectedTables = classifications;
     if (!casList.length || !selectedTables.length) return res.status(400).json({ error: 'Missing params' });
 
-    // Build a column per (table, column) pair — only classified values
-    // First pass: collect all relevant (table, col) keys
-    const tableColMap = {}; // table -> Set<col>
+    const tableColMap = {};
     for (const cas of casList) {
       const tableMap = casIndex.get(cas);
       if (!tableMap) continue;
@@ -520,9 +520,7 @@ async function main() {
       }
     }
 
-    // Build ordered column headers: CAS, Substance Name, then per table
-    const colHeaders = ['CAS', 'Substance Name'];
-    const colKeys = []; // { key, header }
+    const colKeys = [];
     colKeys.push({ key: 'CAS', header: 'CAS' });
     colKeys.push({ key: 'SubstanceName', header: 'Substance Name' });
     for (const table of selectedTables) {
@@ -534,7 +532,6 @@ async function main() {
       }
     }
 
-    // Second pass: build rows
     const rows = [];
     for (const cas of casList) {
       const rowObj = { CAS: cas, SubstanceName: nameIndex.get(cas) || '' };
@@ -577,23 +574,27 @@ async function main() {
     const { cas_numbers = [] } = req.body;
     const casList = new Set(cas_numbers.map(normalizeCas).filter(Boolean));
 
-    const allRows = vtrDb.prepare('SELECT * FROM vtr_all').all();
-    const filtered = allRows.filter(r => {
-      const allCas = extractCasList(r.cas);
-      return allCas.some(c => casList.has(normalizeCas(c)));
-    });
-
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('VTR');
-    if (filtered.length) {
-      const cols = Object.keys(filtered[0]).filter(c => !['id', 'source_system', 'raw_source'].includes(c));
-      ws.columns = cols.map(c => ({ header: c, key: c, width: 20 }));
-      for (const r of filtered) {
+    let headerSet = false;
+
+    for (const cas of casList) {
+      const rowids = vtrIndex.get(cas);
+      if (!rowids?.length) continue;
+      const stmt = vtrDb.prepare('SELECT * FROM vtr_all WHERE rowid = ?');
+      for (const rowid of rowids) {
+        const row = stmt.get(rowid);
+        if (!row) continue;
+        if (!headerSet) {
+          const cols = Object.keys(row).filter(c => !['id', 'source_system', 'raw_source'].includes(c));
+          ws.columns = cols.map(c => ({ header: c, key: c, width: 20 }));
+          ws.getRow(1).font = { bold: true };
+          headerSet = true;
+        }
         const obj = {};
-        for (const c of cols) obj[c] = r[c];
+        for (const c of vtrVisibleColumns) obj[c] = row[c];
         ws.addRow(obj);
       }
-      ws.getRow(1).font = { bold: true };
     }
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -614,12 +615,11 @@ async function main() {
       res.status(500).json({ error: e.message });
     }
   });
- 
+
   app.get('/api/tox-profile/cache', (req, res) => {
     res.json(getCacheStats());
   });
- 
-  
+
   // ─── Static file serving (production) ─────────────────────────────────────
   const distPath = path.join(__dirname, '..', 'dist');
   if (existsSync(distPath)) {
