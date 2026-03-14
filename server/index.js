@@ -116,27 +116,28 @@ const SPECIAL_CARCINOGENICITY = {
 function buildCasIndex(db) {
   console.log('Building CAS index…');
   const tables = FLAT_OPTIONS.map(o => o.value);
-  // Map: normalized CAS → { tableName → [rowid, …] }
+  // Map: normalized CAS → { tableName → rowid (first match only) }
   const index = new Map();
   const nameIndex = new Map();
 
-  const nameTables = ['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China'];
+  const nameTables = new Set(['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China']);
 
   for (const table of tables) {
     try {
-      const rows = db.prepare(`SELECT rowid, * FROM "${table}"`).all();
-      for (const row of rows) {
+      // Use .iterate() to stream rows instead of loading all into memory
+      const stmt = db.prepare(`SELECT rowid, * FROM "${table}"`);
+      for (const row of stmt.iterate()) {
         const allCas = extractCasList(row.CAS);
         for (const cas of allCas) {
           const n = normalizeCas(cas);
           if (!n) continue;
           if (!index.has(n)) index.set(n, {});
           const entry = index.get(n);
-          if (!entry[table]) entry[table] = [];
-          entry[table].push(row.rowid);
+          // Only store first rowid per table (that's all we ever use)
+          if (!entry[table]) entry[table] = row.rowid;
 
           // Name index
-          if (nameTables.includes(table) && !nameIndex.has(n)) {
+          if (nameTables.has(table) && !nameIndex.has(n)) {
             const name = row['Substance Name'];
             if (name) nameIndex.set(n, String(name).trim());
           }
@@ -183,7 +184,7 @@ async function main() {
 
   // Step 2: Open readonly for serving
   const classDb = new Database(classDbPath, { readonly: true });
-  classDb.pragma('cache_size = -64000'); // 64MB read cache
+  classDb.pragma('cache_size = -16000'); // 16MB read cache
   const vtrDb = new Database(vtrDbPath, { readonly: true });
 
   // Build in-memory CAS index
@@ -240,15 +241,12 @@ async function main() {
       }
 
       for (const table of selectedTables) {
-        const rowids = tableMap[table];
-        if (!rowids || !rowids.length) continue;
+        const rowid = tableMap[table];
+        if (rowid == null) continue;
 
         const excluded = new Set(EXCLUDED_COLUMNS[table] || []);
         const prettyTable = table.replace(/_/g, ' ');
         if (!entry.sources.includes(prettyTable)) entry.sources.push(prettyTable);
-
-        // Get first matching row by rowid
-        const rowid = rowids[0];
         let row;
         try {
           row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowid);
@@ -381,11 +379,11 @@ async function main() {
 
       let found = false;
       for (const table of selectedTables) {
-        const rowids = tableMap[table];
-        if (!rowids?.length) continue;
+        const rowid = tableMap[table];
+        if (rowid == null) continue;
         found = true;
         let row;
-        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
+        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowid); } catch { continue; }
         if (!row) continue;
 
         const cols = Object.keys(row).filter(c => !['CAS', 'Substance Name', 'cid'].includes(c));
