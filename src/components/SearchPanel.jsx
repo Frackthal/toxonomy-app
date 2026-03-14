@@ -124,10 +124,13 @@ export default function SearchPanel({
     setShowSuggestions(false);
   };
 
-  const handleExport = (format) => {
+  const handleExport = (type) => {
     const casNumbers = casList.split(/[\n,;]/).map(c => c.trim()).filter(Boolean);
-    const ext = format === 'csv' ? 'csv' : 'xlsx';
-    apiDownload('/export', { cas_numbers: casNumbers, classifications: selectedTablesArray, format }, `export_classifications.${ext}`);
+    if (type === 'multiple') {
+      apiDownload('/export/multiple', { cas_numbers: casNumbers, classifications: selectedTablesArray }, 'export_multiple.xlsx');
+    } else {
+      apiDownload('/export/combined', { cas_numbers: casNumbers, classifications: selectedTablesArray }, 'export_combine.xlsx');
+    }
   };
 
   const totalSources = SOURCES.length;
@@ -215,18 +218,27 @@ export default function SearchPanel({
 
       {/* Export buttons */}
       {showExport && (
-        <div className="flex gap-2">
+        <div className="space-y-1.5">
+          <p className="text-[11px] text-[var(--text-tertiary)] font-medium uppercase tracking-wide">Export XLSX</p>
           <button
-            onClick={() => handleExport('xlsx')}
-            className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--border-color)] text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--surface-100)] transition-colors"
+            onClick={() => handleExport('multiple')}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg border border-[var(--border-color)] text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--surface-100)] transition-colors"
           >
-            <Download size={13} /> XLSX
+            <Download size={13} className="shrink-0 text-tox-600 dark:text-tox-400" />
+            <span className="text-left">
+              <span className="block text-[var(--text-primary)]">Export Multiple</span>
+              <span className="text-[var(--text-tertiary)] font-normal">1 feuille par source</span>
+            </span>
           </button>
           <button
-            onClick={() => handleExport('csv')}
-            className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-[var(--border-color)] text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--surface-100)] transition-colors"
+            onClick={() => handleExport('combined')}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-lg border border-[var(--border-color)] text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--surface-100)] transition-colors"
           >
-            <Download size={13} /> CSV
+            <Download size={13} className="shrink-0 text-indigo-500" />
+            <span className="text-left">
+              <span className="block text-[var(--text-primary)]">Export Combiné</span>
+              <span className="text-[var(--text-tertiary)] font-normal">Synthèse multi-sources</span>
+            </span>
           </button>
         </div>
       )}
