@@ -166,20 +166,25 @@ async function main() {
   await downloadDB('Classifications.db');
   await downloadDB('VTR.db');
 
-  const classDb = new Database(path.join(DATA_DIR, 'Classifications.db'), { readonly: true });
-  const vtrDb = new Database(path.join(DATA_DIR, 'VTR.db'), { readonly: true });
-  classDb.pragma('journal_mode = WAL');
-  classDb.pragma('cache_size = -64000'); // 64MB cache
+  const classDbPath = path.join(DATA_DIR, 'Classifications.db');
+  const vtrDbPath = path.join(DATA_DIR, 'VTR.db');
 
-  // Ensure indexes on CAS columns
+  // Step 1: Open writable to create indexes, then close
+  const writeDb = new Database(classDbPath);
+  writeDb.pragma('journal_mode = WAL');
   const tables = FLAT_OPTIONS.map(o => o.value);
-  const writeDb = new Database(path.join(DATA_DIR, 'Classifications.db'));
   for (const t of tables) {
     try {
       writeDb.exec(`CREATE INDEX IF NOT EXISTS "idx_${t}_cas" ON "${t}" (CAS)`);
     } catch (e) { /* table might not exist */ }
   }
   writeDb.close();
+  console.log('Indexes created.');
+
+  // Step 2: Open readonly for serving
+  const classDb = new Database(classDbPath, { readonly: true });
+  classDb.pragma('cache_size = -64000'); // 64MB read cache
+  const vtrDb = new Database(vtrDbPath, { readonly: true });
 
   // Build in-memory CAS index
   const { index: casIndex, nameIndex } = buildCasIndex(classDb);
