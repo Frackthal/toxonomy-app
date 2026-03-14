@@ -8,6 +8,8 @@ import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { createWriteStream, existsSync, mkdirSync } from 'fs';
 import { pipeline } from 'stream/promises';
 import ExcelJS from 'exceljs';
+import { generateToxProfile, getCacheStats } from './toxProfile.js';
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
@@ -600,6 +602,24 @@ async function main() {
     res.end();
   });
 
+  // ─── API: Tox Profile ─────────────────────────────────────────────────────
+  app.post('/api/tox-profile', async (req, res) => {
+    const { cas } = req.body;
+    if (!cas) return res.status(400).json({ error: 'CAS requis' });
+    try {
+      const profile = await generateToxProfile(cas);
+      res.json(profile);
+    } catch (e) {
+      console.error('Tox profile error:', e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+ 
+  app.get('/api/tox-profile/cache', (req, res) => {
+    res.json(getCacheStats());
+  });
+ 
+  
   // ─── Static file serving (production) ─────────────────────────────────────
   const distPath = path.join(__dirname, '..', 'dist');
   if (existsSync(distPath)) {
