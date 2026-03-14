@@ -1,5 +1,5 @@
-// server/toxProfile.js — Profil toxicologique via PubChem + HSDB + OpenRouter
-// Architecture conservée : 4 prompts parallèles
+// server/toxProfile.js
+// Profil toxicologique via PubChem + full PUG-View + OpenRouter
 // Signature conservée : generateToxProfile(cas)
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
@@ -12,7 +12,6 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || 'http://localhost';
 const OPENROUTER_APP_NAME = process.env.OPENROUTER_APP_NAME || 'Toxonomy';
 
-// ─── Cache mémoire ────────────────────────────────────────────────────────────
 const profileCache = new Map();
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -25,15 +24,13 @@ function getCached(cas) {
   }
   return entry.profile;
 }
-
 function setCache(cas, profile) {
   profileCache.set(cas, { profile, timestamp: Date.now() });
 }
 
-// ─── PubChem fetch ────────────────────────────────────────────────────────────
 async function pubchemGet(url) {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
     if (!res.ok) return null;
     return res.json();
   } catch (e) {
@@ -68,7 +65,12 @@ async function fetchPugView(cid, heading) {
   );
 }
 
-// ─── Helpers d'extraction ─────────────────────────────────────────────────────
+async function fetchFullPugView(cid) {
+  return pubchemGet(
+    `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON`
+  );
+}
+
 function findSection(node, heading) {
   if (!node) return null;
   if (node.TOCHeading === heading) return node;
@@ -91,22 +93,17 @@ function formatRef(raw) {
   return year ? `${author}, ${year}` : author.substring(0, 50);
 }
 
-// tagFilter : tableau de strings — si défini, ne garde que les items dont le texte
-// commence par l'un de ces tags (ex: ['/GENOTOXICITY/', '/MUTAGENICITY/'])
-function extractItems(node, maxItems = 5, maxChars = 800, tagFilter = null) {
+function extractItems(node, maxItems = 6, maxChars = 1000) {
   const items = [];
   function walk(n) {
     if (!n || items.length >= maxItems) return;
     if (n.Information) {
       for (const inf of n.Information) {
         if (items.length >= maxItems) break;
-        const strings = inf.Value?.StringWithMarkup
-          ?.map(s => s.String)
-          .filter(s => s && s.length > 10) || [];
+        const strings = inf.Value?.StringWithMarkup?.map(s => s.String).filter(s => s && s.length > 10) || [];
         const ref = formatRef(inf.Reference?.[0] || '');
         for (const str of strings.slice(0, 2)) {
           if (items.length >= maxItems) break;
-          if (tagFilter && !tagFilter.some(tag => str.startsWith(tag))) continue;
           const text = str.length > maxChars ? str.substring(0, maxChars) + '…' : str;
           items.push({ text: text.trim(), ref });
         }
@@ -118,34 +115,15 @@ function extractItems(node, maxItems = 5, maxChars = 800, tagFilter = null) {
   return items;
 }
 
-function extractSection(heading, ...roots) {
-  const out = [];
-  for (const root of roots) {
-    if (!root) continue;
-    const section = findSection(root, heading);
-    if (section) out.push(...extractItems(section));
-  }
-  return out;
-}
-
-function extractSectionFiltered(heading, tagFilter, root) {
-  if (!root) return [];
-  const section = findSection(root, heading);
-  if (!section) return [];
-  return extractItems(section, 8, 1000, tagFilter);
-}
-
 function serializeSections(sections) {
   const entries = Object.entries(sections).filter(([, items]) => Array.isArray(items) && items.length);
   if (!entries.length) return '';
-
   return entries.map(([heading, items]) => {
-    const lines = items.map((it, i) => `- ${it.text}${it.ref ? ` [${it.ref}]` : ''}`);
+    const lines = items.map(it => `- ${it.text}${it.ref ? ` [${it.ref}]` : ''}`);
     return `## ${heading}\n${lines.join('\n')}`;
   }).join('\n\n');
 }
 
-// ─── Texte PubChem commun ─────────────────────────────────────────────────────
 const PUBCHEM_TOX_HEADINGS = [
   'Acute Effects',
   'Non-Human Toxicity Values',
@@ -169,112 +147,117 @@ const PUBCHEM_TOX_HEADINGS = [
   'Reproductive Effects'
 ];
 
-function buildPubchemText(toxData, ghsData) {
+function buildPubchemText(toxRoot, ghsRoot) {
   const sections = {};
   for (const heading of PUBCHEM_TOX_HEADINGS) {
-    const items = extractSection(heading, toxData, ghsData);
+    const items = [];
+    const a = findSection(toxRoot, heading);
+    const b = findSection(ghsRoot, heading);
+    if (a) items.push(...extractItems(a));
+    if (b) items.push(...extractItems(b));
     if (items.length) sections[heading] = items;
   }
   return serializeSections(sections);
 }
 
-// ─── Textes HSDB par groupe thématique ───────────────────────────────────────
+function sectionLooksHsdb(section) {
+  const s = JSON.stringify(section || {});
+  return s.includes('/source/hsdb/') || s.includes('/source/11933') || s.includes('HSDB record page');
+}
 
-// Groupe 1 — Toxicocinétique / Toxicité aiguë
-function buildHsdbGroup1(hsdbData) {
-  if (!hsdbData) return '';
-  const sections = {};
-  for (const h of ['Metabolism/Pharmacokinetics', 'Toxicokinetics',
-                    'Absorption, Distribution and Excretion']) {
-    const items = extractSection(h, hsdbData);
-    if (items.length) sections[h] = items;
+function collectHsdbHeadings(fullRoot) {
+  const wanted = new Set([
+    'Human Toxicity Excerpts',
+    'Human Toxicity Excerpts (Complete)',
+    'Non-Human Toxicity Excerpts',
+    'Non-Human Toxicity Excerpts (Complete)',
+    'Absorption, Distribution and Excretion',
+    'Absorption, Distribution and Excretion (Complete)',
+    'Metabolism/Metabolites',
+    'Metabolism/Metabolites (Complete)',
+    'Pharmacology',
+    'Pharmacology (Complete)',
+    'Medical Surveillance',
+    'Medical Surveillance (Complete)',
+    'Reported Fatal Dose',
+    'Reported Fatal Dose (Complete)',
+    'Evidence for Carcinogenicity',
+    'Evidence for Carcinogenicity (Complete)',
+    'Occupational Exposure Standards',
+    'Occupational Exposure Standards (Complete)',
+    'NIOSH Recommendations',
+    'NIOSH Recommendations (Complete)',
+    'Preventive Measures',
+    'Preventive Measures (Complete)'
+  ]);
+
+  const found = {};
+  function walk(node) {
+    if (!node) return;
+    if (node.TOCHeading && wanted.has(node.TOCHeading) && sectionLooksHsdb(node)) {
+      found[node.TOCHeading] = node;
+    }
+    if (node.Section) node.Section.forEach(walk);
   }
-  const acute = extractSectionFiltered('Human Health Effects',
-    ['/ACUTE HAZARD', '/ACUTE TOXICITY', '/SIGNS AND SYMPTOMS/'], hsdbData);
-  if (acute.length) sections['Acute toxicity (HSDB Human Health Effects)'] = acute;
-
-  const acuteAnimal = extractSectionFiltered('Animal Toxicity Studies',
-    ['/ACUTE TOXICITY/', '/LABORATORY ANIMALS: ACUTE EXPOSURE/'], hsdbData);
-  if (acuteAnimal.length) sections['Acute toxicity (HSDB Animal Studies)'] = acuteAnimal;
-
-  return serializeSections(sections);
+  walk(fullRoot);
+  return found;
 }
 
-// Groupe 2 — Irritation / Sensibilisation / Doses répétées
-function buildHsdbGroup2(hsdbData) {
-  if (!hsdbData) return '';
-  const sections = {};
-  for (const h of ['Skin, Eye, and Respiratory Irritations', 'Sensitization', 'Immunotoxicity']) {
-    const items = extractSection(h, hsdbData);
-    if (items.length) sections[h] = items;
-  }
-  const irrit = extractSectionFiltered('Human Health Effects',
-    ['/IRRITATION/', '/SKIN IRRITATION/', '/EYE IRRITATION/'], hsdbData);
-  if (irrit.length) sections['Irritation (HSDB Human Health Effects)'] = irrit;
+function buildHsdbGroupsFromFullRecord(fullRoot) {
+  const found = collectHsdbHeadings(fullRoot);
+  const pack = (names) => {
+    const sections = {};
+    for (const name of names) {
+      const node = found[name];
+      if (node) {
+        const items = extractItems(node, 8, 1200);
+        if (items.length) sections[name] = items;
+      }
+    }
+    return serializeSections(sections);
+  };
 
-  const sens = extractSectionFiltered('Human Health Effects',
-    ['/SENSITIZATION/', '/ALLERGIC REACTIONS/', '/ASTHMA/'], hsdbData);
-  if (sens.length) sections['Sensitization (HSDB Human Health Effects)'] = sens;
-
-  const chronic = extractSectionFiltered('Animal Toxicity Studies',
-    ['/LABORATORY ANIMALS: SUBCHRONIC OR PRECHRONIC EXPOSURE/',
-     '/LABORATORY ANIMALS: CHRONIC EXPOSURE AND CARCINOGENICITY/',
-     '/SUBCHRONIC/', '/CHRONIC/'], hsdbData);
-  if (chronic.length) sections['Subchronic/Chronic (HSDB Animal Studies)'] = chronic;
-
-  return serializeSections(sections);
+  return {
+    hsdb1: pack([
+      'Absorption, Distribution and Excretion',
+      'Absorption, Distribution and Excretion (Complete)',
+      'Metabolism/Metabolites',
+      'Metabolism/Metabolites (Complete)',
+      'Human Toxicity Excerpts',
+      'Human Toxicity Excerpts (Complete)',
+      'Non-Human Toxicity Excerpts',
+      'Non-Human Toxicity Excerpts (Complete)'
+    ]),
+    hsdb2: pack([
+      'Human Toxicity Excerpts',
+      'Human Toxicity Excerpts (Complete)',
+      'Medical Surveillance',
+      'Medical Surveillance (Complete)',
+      'Preventive Measures',
+      'Preventive Measures (Complete)'
+    ]),
+    hsdb3: pack([
+      'Evidence for Carcinogenicity',
+      'Evidence for Carcinogenicity (Complete)',
+      'Human Toxicity Excerpts',
+      'Human Toxicity Excerpts (Complete)',
+      'Non-Human Toxicity Excerpts',
+      'Non-Human Toxicity Excerpts (Complete)'
+    ]),
+    hsdb4: pack([
+      'Occupational Exposure Standards',
+      'Occupational Exposure Standards (Complete)',
+      'NIOSH Recommendations',
+      'NIOSH Recommendations (Complete)',
+      'Reported Fatal Dose',
+      'Reported Fatal Dose (Complete)',
+      'Medical Surveillance',
+      'Medical Surveillance (Complete)'
+    ]),
+    foundHeadings: Object.keys(found).sort()
+  };
 }
 
-// Groupe 3 — Génotoxicité / Cancérogénicité / Reproduction
-function buildHsdbGroup3(hsdbData) {
-  if (!hsdbData) return '';
-  const sections = {};
-
-  const genoAnimal = extractSectionFiltered('Animal Toxicity Studies',
-    ['/GENOTOXICITY/', '/MUTAGENICITY/',
-     '/LABORATORY ANIMALS: GENOTOXICITY OR GENETIC TOXICOLOGY/'], hsdbData);
-  if (genoAnimal.length) sections['Genotoxicity (HSDB Animal Studies)'] = genoAnimal;
-
-  const carciHuman = extractSectionFiltered('Human Health Effects',
-    ['/CARCINOGENICITY/', '/EPIDEMIOLOGY STUDIES/', '/SURVEILLANCE/'], hsdbData);
-  if (carciHuman.length) sections['Carcinogenicity epidemiology (HSDB)'] = carciHuman;
-
-  const carciAnimal = extractSectionFiltered('Animal Toxicity Studies',
-    ['/LABORATORY ANIMALS: CHRONIC EXPOSURE AND CARCINOGENICITY/',
-     '/CARCINOGENICITY/'], hsdbData);
-  if (carciAnimal.length) sections['Carcinogenicity animal (HSDB)'] = carciAnimal;
-
-  const reproHuman = extractSectionFiltered('Human Health Effects',
-    ['/REPRODUCTIVE HAZARD/', '/REPRODUCTIVE EFFECTS/', '/TERATOGENICITY/'], hsdbData);
-  if (reproHuman.length) sections['Reproductive effects (HSDB Human)'] = reproHuman;
-
-  const reproAnimal = extractSectionFiltered('Animal Toxicity Studies',
-    ['/REPRODUCTIVE AND DEVELOPMENTAL STUDIES/',
-     '/LABORATORY ANIMALS: DEVELOPMENTAL OR REPRODUCTIVE TOXICOLOGY/',
-     '/TERATOGENICITY/'], hsdbData);
-  if (reproAnimal.length) sections['Reproductive effects (HSDB Animal)'] = reproAnimal;
-
-  return serializeSections(sections);
-}
-
-// Groupe 4 — Données humaines / VTR
-function buildHsdbGroup4(hsdbData) {
-  if (!hsdbData) return '';
-  const sections = {};
-  for (const h of ['Populations at Special Risk', 'Standards and Regulations',
-                    'Medical Surveillance', 'Body Burden', 'Average Daily Intake']) {
-    const items = extractSection(h, hsdbData);
-    if (items.length) sections[h] = items;
-  }
-  const humanExcerpts = extractSectionFiltered('Human Health Effects',
-    ['/SIGNS AND SYMPTOMS/', '/CASE REPORTS/', '/EPIDEMIOLOGY STUDIES/',
-     '/SURVEILLANCE/', '/OTHER TOXICITY INFORMATION/'], hsdbData);
-  if (humanExcerpts.length) sections['Human Health Effects excerpts (HSDB)'] = humanExcerpts;
-
-  return serializeSections(sections);
-}
-
-// ─── Appel OpenRouter ─────────────────────────────────────────────────────────
 async function callOpenRouter(prompt) {
   if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY non configurée');
 
@@ -283,7 +266,6 @@ async function callOpenRouter(prompt) {
     .filter((m, i, arr) => arr.indexOf(m) === i);
 
   let lastError = null;
-
   for (const model of models) {
     try {
       const res = await fetch(OPENROUTER_URL, {
@@ -306,13 +288,12 @@ async function callOpenRouter(prompt) {
 
       if (!res.ok) {
         const err = await res.text();
-        lastError = new Error(`OpenRouter API error ${res.status} (${model}): ${err.substring(0, 300)}`);
+        lastError = new Error(`OpenRouter API error ${res.status} (${model}): ${err.substring(0, 400)}`);
         continue;
       }
 
       const data = await res.json();
       const text = data?.choices?.[0]?.message?.content || '';
-
       if (!text) {
         lastError = new Error(`Réponse OpenRouter vide (${model})`);
         continue;
@@ -327,7 +308,7 @@ async function callOpenRouter(prompt) {
       const firstBrace = clean.indexOf('{');
       const lastBrace = clean.lastIndexOf('}');
       if (firstBrace === -1 || lastBrace <= firstBrace) {
-        lastError = new Error(`Pas de JSON dans la réponse OpenRouter (${model}) : ${clean.substring(0, 200)}`);
+        lastError = new Error(`Pas de JSON dans la réponse OpenRouter (${model})`);
         continue;
       }
 
@@ -342,7 +323,6 @@ async function callOpenRouter(prompt) {
   throw lastError || new Error('Tous les modèles OpenRouter ont échoué');
 }
 
-// ─── Prompts ──────────────────────────────────────────────────────────────────
 const COMMON_RULES = `Règles impératives :
 - Réponds uniquement en JSON valide.
 - N'invente aucune donnée.
@@ -461,7 +441,6 @@ ${pubchemText}
 ${hsdbText || 'Non disponible'}`;
 }
 
-// ─── Fonction principale ──────────────────────────────────────────────────────
 export async function generateToxProfile(cas) {
   const normalizedCas = String(cas || '').trim();
   if (!normalizedCas) throw new Error('CAS manquant');
@@ -474,24 +453,24 @@ export async function generateToxProfile(cas) {
 
   console.log(`[ToxProfile] CAS ${normalizedCas} → CID ${cid}. Fetching data…`);
 
-  const [props, toxData, ghsData, hsdbData] = await Promise.all([
+  const [props, toxData, ghsData, fullData] = await Promise.all([
     getPubchemProps(cid),
     fetchPugView(cid, 'Toxicity'),
     fetchPugView(cid, 'GHS Classification'),
-    fetchPugView(cid, 'Hazardous Substances Data Bank (HSDB)'),
+    fetchFullPugView(cid),
   ]);
 
   const substanceName = props.IUPACName || normalizedCas;
+  const toxRoot = toxData?.Record || null;
+  const ghsRoot = ghsData?.Record || null;
+  const fullRoot = fullData?.Record || null;
 
-  const pubchemText = buildPubchemText(toxData, ghsData);
-
-  const hsdb1 = buildHsdbGroup1(hsdbData);
-  const hsdb2 = buildHsdbGroup2(hsdbData);
-  const hsdb3 = buildHsdbGroup3(hsdbData);
-  const hsdb4 = buildHsdbGroup4(hsdbData);
+  const pubchemText = buildPubchemText(toxRoot, ghsRoot);
+  const { hsdb1, hsdb2, hsdb3, hsdb4, foundHeadings } = buildHsdbGroupsFromFullRecord(fullRoot);
 
   console.log(`[ToxProfile] PubChem: ${pubchemText.length} chars | HSDB groups: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
-  console.log(`[ToxProfile] Sending 4 parallel prompts to OpenRouter…`);
+  console.log(`[ToxProfile] HSDB headings found: ${foundHeadings.join(', ') || '(none)'}`);
+  console.log('[ToxProfile] Sending 4 parallel prompts to OpenRouter…');
 
   const [result1, result2, result3, result4] = await Promise.all([
     callOpenRouter(buildPrompt1(substanceName, normalizedCas, pubchemText, hsdb1)),
@@ -521,7 +500,7 @@ export async function generateToxProfile(cas) {
 
   for (const key of sectionOrder) {
     if (!sections[key]) {
-      sections[key] = { title: key, content: 'Données non disponibles.', available: false };
+      sections[key] = { title: key, content: 'Données non disponibles dans les sources consultées.', available: false };
     }
   }
 
