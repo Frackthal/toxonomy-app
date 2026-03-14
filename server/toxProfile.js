@@ -1,12 +1,13 @@
-// server/toxProfile.js — Profil toxicologique via PubChem + Gemini Flash
-// Ajouter GEMINI_API_KEY dans les variables d'environnement
+// server/toxProfile.js — Profil toxicologique via PubChem + HSDB + Gemini
+// Architecture : 4 prompts parallèles par groupe thématique ECHA
+// Requiert : GEMINI_API_KEY dans les variables d'environnement
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-// ─── Cache mémoire simple ─────────────────────────────────────────────────────
-const profileCache = new Map(); // cas → { profile, timestamp }
+// ─── Cache mémoire ────────────────────────────────────────────────────────────
+const profileCache = new Map();
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
 function getCached(cas) {
@@ -20,11 +21,16 @@ function setCache(cas, profile) {
   profileCache.set(cas, { profile, timestamp: Date.now() });
 }
 
-// ─── PubChem helpers ──────────────────────────────────────────────────────────
+// ─── PubChem fetch helpers ────────────────────────────────────────────────────
 async function pubchemGet(url) {
-  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-  if (!res.ok) return null;
-  return res.json();
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) return null;
+    return res.json();
+  } catch (e) {
+    console.warn(`PubChem fetch failed: ${e.message}`);
+    return null;
+  }
 }
 
 async function getCID(cas) {
@@ -36,35 +42,18 @@ async function getCID(cas) {
 
 async function getPubchemProps(cid) {
   const data = await pubchemGet(
-    `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/property/IUPACName,MolecularFormula,MolecularWeight,CanonicalSMILES/JSON`
+    `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/property/IUPACName,MolecularFormula,MolecularWeight/JSON`
   );
   return data?.PropertyTable?.Properties?.[0] || {};
 }
 
-// Sections PubChem pug_view à récupérer — mappées sur la grille ECHA
-const TOX_HEADINGS = [
-  'Toxicity Summary',
-  'Toxicological Information',
-  'Acute Effects',
-  'Acute Toxicity',
-  'Human Toxicity Excerpts',
-  'Non-Human Toxicity Excerpts',
-  'Human Toxicity Values',
-  'Non-Human Toxicity Values',
-  'Evidence for Carcinogenicity',
-  'Carcinogen Classification',
-  'Reproductive/Developmental',
-  'Mutagenicity',
-  'Subchronic/Chronic Effects',
-  'Health Effects',
-  'Target Organs',
-  'Exposure Routes',
-  'Minimum Risk Level',
-  'EPA IRIS Information',
-  'GHS Classification',
-  'Skin/Eye Irritation',
-];
+async function fetchPugView(cid, heading) {
+  return pubchemGet(
+    `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON?heading=${encodeURIComponent(heading)}`
+  );
+}
 
+// ─── Extraction PubChem ───────────────────────────────────────────────────────
 function findSection(node, heading) {
   if (!node) return null;
   if (node.TOCHeading === heading) return node;
@@ -77,20 +66,31 @@ function findSection(node, heading) {
   return null;
 }
 
-// Extrait les entrées texte + références d'une section
-function extractItems(node, maxPerSection = 8) {
+function formatRef(raw) {
+  if (!raw) return '';
+  if (raw.startsWith('PMID:')) return raw;
+  const yearMatch = raw.match(/\((\d{4})\)/);
+  const year = yearMatch ? yearMatch[1] : '';
+  const authorMatch = raw.match(/^([^;.,\n]{2,40})/);
+  const author = authorMatch ? authorMatch[1].trim() : raw.substring(0, 30);
+  return year ? `${author}, ${year}` : author.substring(0, 50);
+}
+
+function extractItems(node, maxItems = 6, maxChars = 800) {
   const items = [];
   function walk(n) {
-    if (!n) return;
+    if (!n || items.length >= maxItems) return;
     if (n.Information) {
       for (const inf of n.Information) {
-        const strings = inf.Value?.StringWithMarkup?.map(s => s.String).filter(s => s && s.length > 4) || [];
-        const ref = inf.Reference?.[0] || '';
-        // Formater la référence au style "Auteur et al., Année"
-        const refFormatted = formatRef(ref);
+        if (items.length >= maxItems) break;
+        const strings = inf.Value?.StringWithMarkup
+          ?.map(s => s.String)
+          .filter(s => s && s.length > 10) || [];
+        const ref = formatRef(inf.Reference?.[0] || '');
         for (const str of strings.slice(0, 2)) {
-          if (items.length >= maxPerSection) return;
-          items.push({ text: str.trim(), ref: refFormatted });
+          if (items.length >= maxItems) break;
+          const text = str.length > maxChars ? str.substring(0, maxChars) + '…' : str;
+          items.push({ text: text.trim(), ref });
         }
       }
     }
@@ -100,59 +100,23 @@ function extractItems(node, maxPerSection = 8) {
   return items;
 }
 
-// Transforme une référence brute PubChem en format court "Auteur et al., Année"
-function formatRef(raw) {
-  if (!raw) return '';
-  // Exemples de refs PubChem :
-  // "WHO; Environmental Health Criteria 150: Benzene p.46 (1993)"
-  // "IARC. Monographs... (1982)"
-  // "PMID:5644044"
-  // "CDC; Emergency Preparedness..."
-  if (raw.startsWith('PMID:')) return raw;
-
-  // Extraire l'année entre parenthèses
-  const yearMatch = raw.match(/\((\d{4})\)/);
-  const year = yearMatch ? yearMatch[1] : '';
-
-  // Extraire l'organisme/auteur principal (avant le premier ; ou . ou ,)
-  const authorMatch = raw.match(/^([^;.,\n]{2,40})/);
-  const author = authorMatch ? authorMatch[1].trim() : raw.substring(0, 30);
-
-  if (year) return `${author}, ${year}`;
-  return author.substring(0, 50);
-}
-
-async function fetchToxData(cid) {
-  const data = await pubchemGet(
-    `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON?heading=Toxicity`
-  );
-  return data;
-}
-
-async function fetchGHSData(cid) {
-  const data = await pubchemGet(
-    `https://pubchem.ncbi.nlm.nih.gov/rest/pug_view/data/compound/${cid}/JSON?heading=GHS+Classification`
-  );
-  return data;
-}
-
-// Assemble un bloc de texte structuré à envoyer au LLM
-function assembleRawData(props, toxData, ghsData, cas) {
-  const sections = {};
-
-  // Extraire chaque section pertinente
-  for (const heading of TOX_HEADINGS) {
-    const node = findSection(toxData?.Record, heading) || findSection(ghsData?.Record, heading);
+// Extrait une section depuis un ou plusieurs documents PubChem
+function extractSection(heading, ...docs) {
+  for (const doc of docs) {
+    const node = findSection(doc?.Record, heading);
     if (node) {
-      const items = extractItems(node, 10);
-      if (items.length) sections[heading] = items;
+      const items = extractItems(node, 6, 800);
+      if (items.length) return items;
     }
   }
+  return [];
+}
 
-  // Sérialiser en texte brut structuré pour le LLM
-  let text = `SUBSTANCE: ${props.IUPACName || cas} | CAS: ${cas} | Formule: ${props.MolecularFormula || '?'}\n\n`;
-
+// Sérialise un ensemble de sections en texte pour le LLM
+function serializeSections(sections) {
+  let text = '';
   for (const [heading, items] of Object.entries(sections)) {
+    if (!items.length) continue;
     text += `### ${heading}\n`;
     for (const item of items) {
       text += `- ${item.text}`;
@@ -161,104 +125,21 @@ function assembleRawData(props, toxData, ghsData, cas) {
     }
     text += '\n';
   }
-
-  return { text, sections };
-}
-
-// ─── Prompt Gemini ────────────────────────────────────────────────────────────
-function buildPrompt(rawText, substanceName, cas) {
-  return `Tu es un toxicologue expert. À partir des données brutes PubChem ci-dessous, rédige un profil toxicologique structuré selon la grille ECHA/REACH.
-
-RÈGLES IMPORTANTES :
-1. Rédige en français, de manière synthétique et professionnelle
-2. Quand une source est mentionnée entre crochets [Auteur, Année] ou [PMID:xxx], conserve-la telle quelle dans le texte
-3. Si une section n'a pas de données disponibles, écris simplement "Données non disponibles"
-4. Ne pas inventer de données — utilise uniquement ce qui est fourni ci-dessous
-5. Réponds UNIQUEMENT en JSON valide, sans balises markdown, sans texte avant ou après
-
-Structure JSON attendue :
-{
-  "substanceName": "nom de la substance",
-  "cas": "${cas}",
-  "formula": "formule chimique",
-  "generatedAt": "date ISO",
-  "sections": {
-    "toxicokinetics": {
-      "title": "Toxicocinétique et métabolisme",
-      "content": "texte rédigé avec sources",
-      "available": true|false
-    },
-    "acuteToxicity": {
-      "title": "Toxicité aiguë",
-      "content": "texte rédigé. Inclure les valeurs LD50/LC50 par voie (orale, cutanée, inhalation) chez l'animal et les données humaines si disponibles",
-      "available": true|false
-    },
-    "irritationCorrosion": {
-      "title": "Irritation / Corrosion",
-      "content": "texte rédigé",
-      "available": true|false
-    },
-    "sensitization": {
-      "title": "Sensibilisation",
-      "content": "texte rédigé",
-      "available": true|false
-    },
-    "repeatedDoseToxicity": {
-      "title": "Toxicité à doses répétées",
-      "content": "texte rédigé. Inclure NOAEL/LOAEL si disponibles, voie et espèce",
-      "available": true|false
-    },
-    "genotoxicity": {
-      "title": "Mutagénicité / Génotoxicité",
-      "content": "texte rédigé",
-      "available": true|false
-    },
-    "carcinogenicity": {
-      "title": "Cancérogénicité",
-      "content": "texte rédigé. Inclure les classifications IARC, EPA, NTP si disponibles",
-      "available": true|false
-    },
-    "reproductiveToxicity": {
-      "title": "Toxicité pour la reproduction et le développement",
-      "content": "texte rédigé",
-      "available": true|false
-    },
-    "humanData": {
-      "title": "Données humaines",
-      "content": "texte rédigé — études épidémiologiques, cas cliniques, données d'exposition professionnelle",
-      "available": true|false
-    },
-    "referenceValues": {
-      "title": "Valeurs toxicologiques de référence",
-      "content": "texte rédigé. Lister MRL ATSDR, RfC/RfD EPA IRIS, valeurs ACGIH si disponibles",
-      "available": true|false
-    }
-  },
-  "dataQuality": "évaluation courte de la qualité et complétude des données (1-2 phrases)",
-  "sources": ["liste des sources primaires citées dans le profil"]
-}
-
-DONNÉES BRUTES PUBCHEM :
-${rawText}`;
+  return text;
 }
 
 // ─── Appel Gemini ─────────────────────────────────────────────────────────────
 async function callGemini(prompt) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY non configurée');
 
-  const body = {
-    contents: [{ parts: [{ text: prompt }] }],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: 65536,
-    },
-  };
-
   const res = await fetch(GEMINI_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(60000),
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 16384 },
+    }),
+    signal: AbortSignal.timeout(120000),
   });
 
   if (!res.ok) {
@@ -267,60 +148,288 @@ async function callGemini(prompt) {
   }
 
   const data = await res.json();
+  const finishReason = data?.candidates?.[0]?.finishReason;
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-  // Extraction robuste du JSON — cherche la première { et la dernière }
-  const firstBrace = text.indexOf('{');
-  const lastBrace = text.lastIndexOf('}');
-  
-  if (firstBrace === -1 || lastBrace === -1) {
-    throw new Error(`Réponse Gemini sans JSON détectable : ${text.substring(0, 200)}`);
+  if (!text) {
+    const blockReason = data?.promptFeedback?.blockReason;
+    throw new Error(blockReason
+      ? `Requête bloquée par Gemini : ${blockReason}`
+      : `Réponse Gemini vide (finishReason: ${finishReason})`
+    );
   }
 
-  const jsonStr = text.slice(firstBrace, lastBrace + 1);
+  // Extraction robuste du JSON
+  const clean = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/\s*```\s*$/i, '')
+    .trim();
+
+  const firstBrace = clean.indexOf('{');
+  const lastBrace = clean.lastIndexOf('}');
+
+  if (firstBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error(`Pas de JSON dans la réponse Gemini : ${clean.substring(0, 200)}`);
+  }
 
   try {
-    return JSON.parse(jsonStr);
+    return JSON.parse(clean.slice(firstBrace, lastBrace + 1));
   } catch (e) {
-    throw new Error(`Réponse Gemini non parseable : ${jsonStr.substring(0, 300)}`);
+    throw new Error(`JSON non parseable : ${clean.slice(firstBrace, firstBrace + 400)}`);
   }
 }
 
-// ─── Fonction principale exportée ─────────────────────────────────────────────
+// ─── Règles communes pour tous les prompts ────────────────────────────────────
+const COMMON_RULES = `RÈGLES :
+1. Rédige en français, de manière synthétique et professionnelle
+2. Conserve les références entre crochets [Auteur, Année] ou [PMID:xxx] telles quelles
+3. Distingue clairement données humaines et données animales
+4. Mentionne toujours la voie d'exposition (orale, inhalation, cutanée) et l'espèce animale
+5. Si données insuffisantes pour une section : "available": false, "content": "Données non disponibles"
+6. Réponds UNIQUEMENT en JSON valide, sans markdown, sans texte avant ou après`;
+
+// ─── Prompt 1 : Toxicocinétique + Toxicité aiguë ─────────────────────────────
+function buildPrompt1(substanceName, cas, rawData) {
+  return `Tu es un toxicologue expert rédigeant un profil ECHA/REACH.
+${COMMON_RULES}
+
+Substance : ${substanceName} | CAS : ${cas}
+
+Génère ce JSON :
+{
+  "toxicokinetics": {
+    "title": "Toxicocinétique et métabolisme",
+    "content": "Absorption (voies et taux), distribution, métabolisme (principaux métabolites, enzymes impliquées), excrétion. Données humaines et animales.",
+    "available": true
+  },
+  "acuteToxicity": {
+    "title": "Toxicité aiguë",
+    "content": "Valeurs LD50/LC50 par voie (orale, inhalation, cutanée) et par espèce. Signes cliniques aigus chez l'animal et chez l'homme. Concentrations létales humaines si connues.",
+    "available": true
+  }
+}
+
+DONNÉES :
+${rawData}`;
+}
+
+// ─── Prompt 2 : Irritation + Sensibilisation + Doses répétées ────────────────
+function buildPrompt2(substanceName, cas, rawData) {
+  return `Tu es un toxicologue expert rédigeant un profil ECHA/REACH.
+${COMMON_RULES}
+
+Substance : ${substanceName} | CAS : ${cas}
+
+Génère ce JSON :
+{
+  "irritationCorrosion": {
+    "title": "Irritation / Corrosion",
+    "content": "Effets irritants ou corrosifs sur la peau, les yeux et les voies respiratoires. Données humaines et animales.",
+    "available": true
+  },
+  "sensitization": {
+    "title": "Sensibilisation",
+    "content": "Potentiel de sensibilisation cutanée ou respiratoire. Résultats des tests (LLNA, Buehler, GPT, etc.).",
+    "available": true
+  },
+  "repeatedDoseToxicity": {
+    "title": "Toxicité à doses répétées",
+    "content": "Effets subchroniques et chroniques. NOAEL/LOAEL avec espèce, voie d'exposition et durée. Organes cibles identifiés.",
+    "available": true
+  }
+}
+
+DONNÉES :
+${rawData}`;
+}
+
+// ─── Prompt 3 : Génotoxicité + Cancérogénicité + Reproduction ────────────────
+function buildPrompt3(substanceName, cas, rawData) {
+  return `Tu es un toxicologue expert rédigeant un profil ECHA/REACH.
+${COMMON_RULES}
+
+Substance : ${substanceName} | CAS : ${cas}
+
+Génère ce JSON :
+{
+  "genotoxicity": {
+    "title": "Mutagénicité / Génotoxicité",
+    "content": "Résultats in vitro (test d'Ames, aberrations chromosomiques, échanges de chromatides sœurs) et in vivo (micronoyaux, etc.). Données humaines si disponibles.",
+    "available": true
+  },
+  "carcinogenicity": {
+    "title": "Cancérogénicité",
+    "content": "Classifications : IARC (groupe), EPA (catégorie), NTP, ACGIH. Données épidémiologiques humaines (type de cancer, exposition). Données animales (espèces, voies, organes cibles).",
+    "available": true
+  },
+  "reproductiveToxicity": {
+    "title": "Toxicité pour la reproduction et le développement",
+    "content": "Effets sur la fertilité masculine et féminine. Effets sur le développement embryonnaire/fœtal (tératogénicité, embryotoxicité). Données humaines et animales.",
+    "available": true
+  }
+}
+
+DONNÉES :
+${rawData}`;
+}
+
+// ─── Prompt 4 : Données humaines + VTR ───────────────────────────────────────
+function buildPrompt4(substanceName, cas, rawData) {
+  return `Tu es un toxicologue expert rédigeant un profil ECHA/REACH.
+${COMMON_RULES}
+
+Substance : ${substanceName} | CAS : ${cas}
+
+Génère ce JSON :
+{
+  "humanData": {
+    "title": "Données humaines",
+    "content": "Études épidémiologiques (cohortes, cas-témoins), cas cliniques, données d'exposition professionnelle. Effets observés, niveaux d'exposition associés, populations étudiées.",
+    "available": true
+  },
+  "referenceValues": {
+    "title": "Valeurs toxicologiques de référence",
+    "content": "MRL ATSDR (inhalation aiguë, intermédiaire, chronique ; orale chronique). RfC et RfD EPA IRIS. Slope factor cancérogène (SF oral, IUR inhalation) si disponible. TLV-TWA ACGIH si mentionné.",
+    "available": true
+  }
+}
+
+DONNÉES :
+${rawData}`;
+}
+
+// ─── Fonction principale ──────────────────────────────────────────────────────
 export async function generateToxProfile(cas) {
   const normalizedCas = cas.trim();
 
-  // Vérifier le cache
   const cached = getCached(normalizedCas);
   if (cached) return { ...cached, fromCache: true };
 
-  // 1. Obtenir le CID PubChem
+  // 1. CID PubChem
   const cid = await getCID(normalizedCas);
   if (!cid) throw new Error(`Substance non trouvée dans PubChem pour CAS ${normalizedCas}`);
 
-  // 2. Fetch en parallèle
-  const [props, toxData, ghsData] = await Promise.all([
+  console.log(`[ToxProfile] CAS ${normalizedCas} → CID ${cid}. Fetching PubChem data…`);
+
+  // 2. Fetch toutes les sources en parallèle
+  const [props, toxData, ghsData, hsdbData] = await Promise.all([
     getPubchemProps(cid),
-    fetchToxData(cid),
-    fetchGHSData(cid),
+    fetchPugView(cid, 'Toxicity'),
+    fetchPugView(cid, 'GHS Classification'),
+    fetchPugView(cid, 'Hazardous Substances Data Bank (HSDB)'),
   ]);
 
-  // 3. Assembler les données brutes
-  const { text: rawText } = assembleRawData(props, toxData, ghsData, normalizedCas);
-
-  // 4. Appel Gemini
   const substanceName = props.IUPACName || normalizedCas;
-  const prompt = buildPrompt(rawText, substanceName, normalizedCas);
-  const profile = await callGemini(prompt);
+  console.log(`[ToxProfile] Data fetched. Building section groups…`);
 
-  // Ajouter métadonnées
-  profile.cid = cid;
-  profile.generatedAt = new Date().toISOString();
-  profile.fromCache = false;
+  // 3. Construire les 4 blocs de données thématiques
 
-  // 5. Mettre en cache
+  // Groupe 1 — Toxicocinétique + Toxicité aiguë
+  const group1Sections = {
+    'Metabolism/Pharmacokinetics': extractSection('Metabolism/Pharmacokinetics', hsdbData, toxData),
+    'Toxicokinetics':              extractSection('Toxicokinetics', hsdbData, toxData),
+    'Toxicity Summary':            extractSection('Toxicity Summary', toxData, hsdbData),
+    'Acute Effects':               extractSection('Acute Effects', toxData),
+    'Acute Toxicity':              extractSection('Acute Toxicity', toxData),
+    'Non-Human Toxicity Values':   extractSection('Non-Human Toxicity Values', toxData),
+    'Human Toxicity Values':       extractSection('Human Toxicity Values', toxData),
+    'Reported Fatal Dose':         extractSection('Reported Fatal Dose', hsdbData),
+  };
+
+  // Groupe 2 — Irritation + Sensibilisation + Doses répétées
+  const group2Sections = {
+    'Skin, Eye, and Respiratory Irritations': extractSection('Skin, Eye, and Respiratory Irritations', hsdbData, toxData),
+    'Skin/Eye Irritation':                    extractSection('Skin/Eye Irritation', toxData),
+    'Sensitization':                          extractSection('Sensitization', hsdbData, toxData),
+    'Immunotoxicity':                         extractSection('Immunotoxicity', hsdbData),
+    'Subchronic/Chronic Effects':             extractSection('Subchronic/Chronic Effects', toxData),
+    'Non-Human Toxicity Excerpts':            extractSection('Non-Human Toxicity Excerpts', toxData),
+    'Target Organs':                          extractSection('Target Organs', toxData),
+    'Neurotoxicity':                          extractSection('Neurotoxicity', hsdbData),
+    'GHS Classification':                     extractSection('GHS Classification', ghsData),
+  };
+
+  // Groupe 3 — Génotoxicité + Cancérogénicité + Reproduction
+  const group3Sections = {
+    'Mutagenicity':               extractSection('Mutagenicity', toxData, hsdbData),
+    'Evidence for Carcinogenicity': extractSection('Evidence for Carcinogenicity', toxData, hsdbData),
+    'Carcinogen Classification':  extractSection('Carcinogen Classification', toxData),
+    'Carcinogenicity':            extractSection('Carcinogenicity', hsdbData),
+    'Reproductive/Developmental': extractSection('Reproductive/Developmental', toxData),
+    'Reproductive Hazard':        extractSection('Reproductive Hazard', hsdbData),
+  };
+
+  // Groupe 4 — Données humaines + VTR
+  const group4Sections = {
+    'Human Toxicity Excerpts':    extractSection('Human Toxicity Excerpts', toxData, hsdbData),
+    'Human Health Effects':       extractSection('Human Health Effects', hsdbData),
+    'Exposure Routes':            extractSection('Exposure Routes', toxData),
+    'Populations at Special Risk': extractSection('Populations at Special Risk', hsdbData),
+    'Minimum Risk Level':         extractSection('Minimum Risk Level', toxData),
+    'EPA IRIS Information':       extractSection('EPA IRIS Information', toxData),
+    'Health Effects':             extractSection('Health Effects', toxData),
+  };
+
+  const raw1 = serializeSections(group1Sections);
+  const raw2 = serializeSections(group2Sections);
+  const raw3 = serializeSections(group3Sections);
+  const raw4 = serializeSections(group4Sections);
+
+  console.log(`[ToxProfile] Sending 4 parallel prompts to Gemini…`);
+  console.log(`  Group sizes: ${raw1.length} / ${raw2.length} / ${raw3.length} / ${raw4.length} chars`);
+
+  // 4. Appels Gemini en parallèle
+  const [result1, result2, result3, result4] = await Promise.all([
+    callGemini(buildPrompt1(substanceName, normalizedCas, raw1)),
+    callGemini(buildPrompt2(substanceName, normalizedCas, raw2)),
+    callGemini(buildPrompt3(substanceName, normalizedCas, raw3)),
+    callGemini(buildPrompt4(substanceName, normalizedCas, raw4)),
+  ]);
+
+  // 5. Assembler le profil final
+  const profile = {
+    substanceName,
+    cas: normalizedCas,
+    formula: props.MolecularFormula || '',
+    molecularWeight: props.MolecularWeight || '',
+    cid,
+    generatedAt: new Date().toISOString(),
+    fromCache: false,
+    sections: {
+      toxicokinetics:       result1.toxicokinetics,
+      acuteToxicity:        result1.acuteToxicity,
+      irritationCorrosion:  result2.irritationCorrosion,
+      sensitization:        result2.sensitization,
+      repeatedDoseToxicity: result2.repeatedDoseToxicity,
+      genotoxicity:         result3.genotoxicity,
+      carcinogenicity:      result3.carcinogenicity,
+      reproductiveToxicity: result3.reproductiveToxicity,
+      humanData:            result4.humanData,
+      referenceValues:      result4.referenceValues,
+    },
+  };
+
+  // Validation — s'assurer que toutes les sections sont présentes
+  const sectionOrder = [
+    'toxicokinetics', 'acuteToxicity', 'irritationCorrosion', 'sensitization',
+    'repeatedDoseToxicity', 'genotoxicity', 'carcinogenicity',
+    'reproductiveToxicity', 'humanData', 'referenceValues',
+  ];
+  for (const key of sectionOrder) {
+    if (!profile.sections[key]) {
+      profile.sections[key] = {
+        title: key,
+        content: 'Données non disponibles.',
+        available: false,
+      };
+    }
+  }
+
+  const availableCount = sectionOrder.filter(k => profile.sections[k]?.available).length;
+  console.log(`[ToxProfile] Profile complete: ${availableCount}/10 sections available.`);
+
   setCache(normalizedCas, profile);
-
   return profile;
 }
 
