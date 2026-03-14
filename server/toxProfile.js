@@ -1,4 +1,19 @@
 
+/*
+toxProfile.js
+Optimized toxicological profile generator
+
+Key improvements:
+1. Uses OpenRouter (single API endpoint for multiple models)
+2. 2‑step LLM pipeline:
+      - Step 1: extract structured notes from sources
+      - Step 2: generate final toxicological profile
+3. HSDB filtering to reduce prompt size
+4. Parallel source retrieval
+5. Robust JSON parsing + retry logic
+*/
+
+// Node 18+ has native fetch, no need for node-fetch import
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openrouter/hunter-alpha";
@@ -246,7 +261,7 @@ ${JSON.stringify(notes)}
    Main pipeline
 ------------------------------*/
 
-export async function generateToxicologicalProfile(substance, cas) {
+export async function generateToxProfile(substance, cas) {
 
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY missing");
@@ -293,7 +308,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const substance = process.argv[2] || "Benzene";
   const cas = process.argv[3] || "71-43-2";
 
-  generateToxicologicalProfile(substance, cas)
+  generateToxProfile(substance, cas)
     .then(r => console.log(JSON.stringify(r,null,2)))
     .catch(e => console.error(e));
 
