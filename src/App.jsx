@@ -6,6 +6,8 @@ import Sidebar from './components/Sidebar';
 import ClassificationsPage from './pages/ClassificationsPage';
 import VTRPage from './pages/VTRPage';
 import DocumentationPage from './pages/DocumentationPage';
+import ToxProfilePage from './pages/ToxProfilePage';
+
 
 export default function App() {
   const [dark, setDark] = useDarkMode();
@@ -51,6 +53,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<ClassificationsPage />} />
             <Route path="/vtr" element={<VTRPage />} />
+            <Route path="/tox-profile" element={<ToxProfilePage />} />
             <Route path="/documentation" element={<DocumentationPage />} />
           </Routes>
         </main>
