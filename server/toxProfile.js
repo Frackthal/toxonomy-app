@@ -1,26 +1,4 @@
 
-/*
-toxProfile.js
-Optimized toxicological profile generator
-
-Key improvements:
-1. Uses OpenRouter (single API endpoint for multiple models)
-2. 2‑step LLM pipeline:
-      - Step 1: extract structured notes from sources
-      - Step 2: generate final toxicological profile
-3. HSDB filtering to reduce prompt size
-4. Parallel source retrieval
-5. Robust JSON parsing + retry logic
-
-Environment variables:
-OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=openrouter/hunter-alpha
-OPENROUTER_FALLBACK_MODELS=google/gemini-3-flash-preview,openrouter/free
-OPENROUTER_SITE_URL=http://localhost:3000
-OPENROUTER_APP_NAME=Toxonomy
-*/
-
-import fetch from "node-fetch";
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openrouter/hunter-alpha";
