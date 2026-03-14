@@ -116,28 +116,27 @@ const SPECIAL_CARCINOGENICITY = {
 function buildCasIndex(db) {
   console.log('Building CAS index…');
   const tables = FLAT_OPTIONS.map(o => o.value);
-  // Map: normalized CAS → { tableName → rowid (first match only) }
+  // Map: normalized CAS → { tableName → [rowid, …] }
   const index = new Map();
   const nameIndex = new Map();
 
-  const nameTables = new Set(['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China']);
+  const nameTables = ['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China'];
 
   for (const table of tables) {
     try {
-      // Use .iterate() to stream rows instead of loading all into memory
-      const stmt = db.prepare(`SELECT rowid, * FROM "${table}"`);
-      for (const row of stmt.iterate()) {
+      const rows = db.prepare(`SELECT rowid, * FROM "${table}"`).all();
+      for (const row of rows) {
         const allCas = extractCasList(row.CAS);
         for (const cas of allCas) {
           const n = normalizeCas(cas);
           if (!n) continue;
           if (!index.has(n)) index.set(n, {});
           const entry = index.get(n);
-          // Only store first rowid per table (that's all we ever use)
-          if (!entry[table]) entry[table] = row.rowid;
+          if (!entry[table]) entry[table] = [];
+          entry[table].push(row.rowid);
 
           // Name index
-          if (nameTables.has(table) && !nameIndex.has(n)) {
+          if (nameTables.includes(table) && !nameIndex.has(n)) {
             const name = row['Substance Name'];
             if (name) nameIndex.set(n, String(name).trim());
           }
@@ -184,7 +183,7 @@ async function main() {
 
   // Step 2: Open readonly for serving
   const classDb = new Database(classDbPath, { readonly: true });
-  classDb.pragma('cache_size = -16000'); // 16MB read cache
+  classDb.pragma('cache_size = -64000'); // 64MB read cache
   const vtrDb = new Database(vtrDbPath, { readonly: true });
 
   // Build in-memory CAS index
@@ -241,12 +240,15 @@ async function main() {
       }
 
       for (const table of selectedTables) {
-        const rowid = tableMap[table];
-        if (rowid == null) continue;
+        const rowids = tableMap[table];
+        if (!rowids || !rowids.length) continue;
 
         const excluded = new Set(EXCLUDED_COLUMNS[table] || []);
         const prettyTable = table.replace(/_/g, ' ');
         if (!entry.sources.includes(prettyTable)) entry.sources.push(prettyTable);
+
+        // Get first matching row by rowid
+        const rowid = rowids[0];
         let row;
         try {
           row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowid);
@@ -379,11 +381,11 @@ async function main() {
 
       let found = false;
       for (const table of selectedTables) {
-        const rowid = tableMap[table];
-        if (rowid == null) continue;
+        const rowids = tableMap[table];
+        if (!rowids?.length) continue;
         found = true;
         let row;
-        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowid); } catch { continue; }
+        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
         if (!row) continue;
 
         const cols = Object.keys(row).filter(c => !['CAS', 'Substance Name', 'cid'].includes(c));
@@ -422,6 +424,148 @@ async function main() {
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename=export_classifications.xlsx');
+    await wb.xlsx.write(res);
+    res.end();
+  });
+
+  // ─── API: Export Multiple (one sheet per source) ─────────────────────────
+  app.post('/api/export/multiple', async (req, res) => {
+    const { cas_numbers = [], classifications = [] } = req.body;
+    const casList = cas_numbers.map(normalizeCas).filter(Boolean);
+    const selectedTables = classifications;
+    if (!casList.length || !selectedTables.length) return res.status(400).json({ error: 'Missing params' });
+
+    const wb = new ExcelJS.Workbook();
+    const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1B4F72' } };
+    const HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' } };
+
+    for (const table of selectedTables) {
+      const sheetRows = [];
+      let allColumns = null;
+
+      for (const cas of casList) {
+        const tableMap = casIndex.get(cas);
+        if (!tableMap) continue;
+        const rowids = tableMap[table];
+        if (!rowids?.length) continue;
+
+        for (const rowid of rowids) {
+          let row;
+          try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowid); } catch { continue; }
+          if (!row) continue;
+          if (!allColumns) allColumns = Object.keys(row).filter(c => c !== 'rowid');
+          // Inject substance name if not already present
+          const enriched = { CAS: cas, 'Substance Name': nameIndex.get(cas) || row['Substance Name'] || '', ...row };
+          sheetRows.push(enriched);
+        }
+      }
+
+      if (!sheetRows.length) continue;
+
+      const sheetName = table.replace(/_/g, ' ').substring(0, 31);
+      const ws = wb.addWorksheet(sheetName);
+      const baseCols = ['CAS', 'Substance Name'];
+      const extraCols = (allColumns || []).filter(c => !['CAS', 'Substance Name'].includes(c));
+      const cols = [...baseCols, ...extraCols];
+      ws.columns = cols.map(c => ({ header: c, key: c, width: Math.min(40, Math.max(12, c.length + 4)) }));
+      for (const r of sheetRows) {
+        const obj = {};
+        for (const c of cols) obj[c] = r[c] ?? '';
+        ws.addRow(obj);
+      }
+      const hrow = ws.getRow(1);
+      hrow.font = HEADER_FONT;
+      hrow.fill = HEADER_FILL;
+      hrow.alignment = { wrapText: false };
+    }
+
+    if (wb.worksheets.length === 0) {
+      // Add empty sheet to avoid corrupt file
+      wb.addWorksheet('Aucun résultat');
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=export_multiple.xlsx');
+    await wb.xlsx.write(res);
+    res.end();
+  });
+
+  // ─── API: Export Combined (one sheet, all sources merged) ────────────────
+  app.post('/api/export/combined', async (req, res) => {
+    const { cas_numbers = [], classifications = [] } = req.body;
+    const casList = cas_numbers.map(normalizeCas).filter(Boolean);
+    const selectedTables = classifications;
+    if (!casList.length || !selectedTables.length) return res.status(400).json({ error: 'Missing params' });
+
+    // Build a column per (table, column) pair — only classified values
+    // First pass: collect all relevant (table, col) keys
+    const tableColMap = {}; // table -> Set<col>
+    for (const cas of casList) {
+      const tableMap = casIndex.get(cas);
+      if (!tableMap) continue;
+      for (const table of selectedTables) {
+        const rowids = tableMap[table];
+        if (!rowids?.length) continue;
+        let row;
+        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
+        if (!row) continue;
+        if (!tableColMap[table]) tableColMap[table] = new Set();
+        const excluded = new Set(['CAS', 'Substance Name', ...(EXCLUDED_COLUMNS[table] || [])]);
+        for (const col of Object.keys(row)) {
+          if (excluded.has(col)) continue;
+          if (isClassified(row[col])) tableColMap[table].add(col);
+        }
+      }
+    }
+
+    // Build ordered column headers: CAS, Substance Name, then per table
+    const colHeaders = ['CAS', 'Substance Name'];
+    const colKeys = []; // { key, header }
+    colKeys.push({ key: 'CAS', header: 'CAS' });
+    colKeys.push({ key: 'SubstanceName', header: 'Substance Name' });
+    for (const table of selectedTables) {
+      const cols = tableColMap[table];
+      if (!cols || !cols.size) continue;
+      const tableShort = table.replace(/_/g, ' ');
+      for (const col of cols) {
+        colKeys.push({ key: `${table}||${col}`, header: `${tableShort} — ${col}` });
+      }
+    }
+
+    // Second pass: build rows
+    const rows = [];
+    for (const cas of casList) {
+      const rowObj = { CAS: cas, SubstanceName: nameIndex.get(cas) || '' };
+      const tableMap = casIndex.get(cas);
+      if (tableMap) {
+        for (const table of selectedTables) {
+          const rowids = tableMap[table];
+          if (!rowids?.length) continue;
+          let row;
+          try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
+          if (!row) continue;
+          const cols = tableColMap[table];
+          if (!cols) continue;
+          for (const col of cols) {
+            rowObj[`${table}||${col}`] = row[col] ?? '';
+          }
+        }
+      }
+      rows.push(rowObj);
+    }
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Classifications combinées');
+    ws.columns = colKeys.map(ck => ({ header: ck.header, key: ck.key, width: Math.min(40, Math.max(12, ck.header.length + 2)) }));
+    for (const r of rows) ws.addRow(r);
+    const hrow = ws.getRow(1);
+    hrow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    hrow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0A5C2D' } };
+    hrow.alignment = { wrapText: true };
+    ws.views = [{ state: 'frozen', xSplit: 2, ySplit: 1 }];
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename=export_combine.xlsx');
     await wb.xlsx.write(res);
     res.end();
   });
