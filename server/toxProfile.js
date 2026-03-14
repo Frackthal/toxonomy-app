@@ -313,3 +313,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     .catch(e => console.error(e));
 
 }
+
+/* -----------------------------
+   Cache stats (compatibility)
+------------------------------*/
+
+export function getCacheStats() {
+  return {
+    enabled: false,
+    entries: 0
+  };
