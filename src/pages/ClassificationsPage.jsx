@@ -21,7 +21,7 @@ export default function ClassificationsPage() {
   return (
     <div className="flex flex-col lg:flex-row h-full">
       {/* Left panel */}
-      <div className="w-full lg:w-72 xl:w-80 shrink-0 border-b lg:border-b-0 lg:border-r border-[var(--border-color)] bg-[var(--surface-0)] overflow-y-auto">
+      <div className="w-full lg:w-72 xl:w-80 shrink-0 border-b lg:border-b-0 lg:border-r border-[var(--border-color)] bg-[var(--surface-0)] overflow-y-auto max-h-[50vh] lg:max-h-none">
         <div className="p-4 space-y-5">
           <SearchPanel
             casList={casList}
