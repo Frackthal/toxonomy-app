@@ -266,7 +266,13 @@ function collectHsdbHeadings(fullRoot) {
     'NIOSH Recommendations (Complete)',
     'Preventive Measures',
     'Preventive Measures (Complete)',
-    'Animal Toxicity Studies'
+    'Animal Toxicity Studies',
+    'Genotoxicity',
+    'Genotoxicity (Complete)',
+    'Reproductive Effects',
+    'Reproductive Effects (Complete)',
+    'Developmental Toxicity/Teratogenicity',
+    'Developmental Toxicity/Teratogenicity (Complete)',
   ]);
 
   const found = {};
@@ -287,6 +293,27 @@ function mergeSections(...entries) {
     if (items?.length) out[title] = items;
   }
   return serializeSections(out);
+}
+
+function extractSubSectionItems(parentNode, subHeadings, maxItems = 10, maxChars = 1400) {
+  // Navigate into sub-sections by TOCHeading (instead of prefix-matching text content)
+  const items = [];
+  if (!parentNode) return items;
+  const normalizedHeadings = subHeadings.map(h => h.toLowerCase());
+
+  function walk(n) {
+    if (!n || items.length >= maxItems) return;
+    if (n.TOCHeading) {
+      const lower = n.TOCHeading.toLowerCase();
+      if (normalizedHeadings.some(h => lower.includes(h))) {
+        items.push(...extractItems(n, maxItems - items.length, maxChars));
+        return; // Don't recurse deeper once we matched
+      }
+    }
+    if (n.Section) n.Section.forEach(walk);
+  }
+  walk(parentNode);
+  return items;
 }
 
 function buildHsdbGroupsFromFullRecord(fullRoot) {
@@ -343,19 +370,33 @@ function buildHsdbGroupsFromFullRecord(fullRoot) {
   );
 
   const hsdb3 = mergeSections(
-    ['Human Toxicity Excerpts (Complete) - genotoxicity', humanComplete ? extractPrefixedItems(humanComplete, [
-      '/genotoxicity/'
+    // --- Genotoxicity: direct HSDB sections ---
+    ['Genotoxicity', getItems('Genotoxicity')],
+    ['Genotoxicity (Complete)', getItems('Genotoxicity (Complete)')],
+    // --- Genotoxicity: sub-sections within Human/Non-Human Toxicity Excerpts ---
+    ['Human Toxicity Excerpts (Complete) - genotoxicity', humanComplete ? extractSubSectionItems(humanComplete, [
+      'genotoxicity', 'mutagenicity', 'genetic toxicology'
     ]) : []],
-    ['Non-Human Toxicity Excerpts (Complete) - genotoxicity', nonHumanComplete ? extractPrefixedItems(nonHumanComplete, [
-      '/genotoxicity/'
+    ['Non-Human Toxicity Excerpts (Complete) - genotoxicity', nonHumanComplete ? extractSubSectionItems(nonHumanComplete, [
+      'genotoxicity', 'mutagenicity', 'genetic toxicology'
     ]) : []],
+    // --- Carcinogenicity ---
     ['Evidence for Carcinogenicity', getItems('Evidence for Carcinogenicity')],
     ['Evidence for Carcinogenicity (Complete)', getItems('Evidence for Carcinogenicity (Complete)')],
-    ['Non-Human Toxicity Excerpts (Complete) - reprotox', nonHumanComplete ? extractPrefixedItems(nonHumanComplete, [
-      '/laboratory animals: developmental or reproductive toxicity/'
+    // --- Reproductive/Developmental Toxicity: direct HSDB sections ---
+    ['Reproductive Effects', getItems('Reproductive Effects')],
+    ['Reproductive Effects (Complete)', getItems('Reproductive Effects (Complete)')],
+    ['Developmental Toxicity/Teratogenicity', getItems('Developmental Toxicity/Teratogenicity')],
+    ['Developmental Toxicity/Teratogenicity (Complete)', getItems('Developmental Toxicity/Teratogenicity (Complete)')],
+    // --- Reprotox: sub-sections within Human/Non-Human Toxicity Excerpts ---
+    ['Human Toxicity Excerpts (Complete) - reprotox', humanComplete ? extractSubSectionItems(humanComplete, [
+      'reproductive', 'developmental', 'teratogenicity', 'fertility'
     ]) : []],
-    ['Animal Toxicity Studies - reprotox', animalStudies ? extractPrefixedItems(animalStudies, [
-      '/laboratory animals: developmental or reproductive toxicity/'
+    ['Non-Human Toxicity Excerpts (Complete) - reprotox', nonHumanComplete ? extractSubSectionItems(nonHumanComplete, [
+      'reproductive', 'developmental', 'teratogenicity', 'fertility'
+    ]) : []],
+    ['Animal Toxicity Studies - reprotox', animalStudies ? extractSubSectionItems(animalStudies, [
+      'reproductive', 'developmental', 'teratogenicity', 'fertility'
     ]) : []]
   );
 
