@@ -159,6 +159,57 @@ function extractPrefixedItems(node, prefixes, maxItems = 10, maxChars = 1400) {
   return items;
 }
 
+// Like extractPrefixedItems but matches keywords ANYWHERE in text (not just prefix)
+function extractKeywordItems(node, keywords, maxItems = 10, maxChars = 1400) {
+  const items = [];
+  const normKeywords = keywords.map(k => k.toLowerCase());
+
+  function walk(n) {
+    if (!n || items.length >= maxItems) return;
+
+    if (n.Information) {
+      for (const inf of n.Information) {
+        if (items.length >= maxItems) break;
+        const strings = inf.Value?.StringWithMarkup?.map(s => s.String).filter(s => s && s.length > 10) || [];
+        const ref = formatRef(inf.Reference?.[0] || '');
+        for (const str of strings) {
+          if (items.length >= maxItems) break;
+          const lower = str.trim().toLowerCase();
+          if (!normKeywords.some(k => lower.includes(k))) continue;
+          const text = str.length > maxChars ? str.substring(0, maxChars) + '…' : str;
+          items.push({ text: text.trim(), ref });
+        }
+      }
+    }
+
+    if (n.Section) n.Section.forEach(walk);
+  }
+
+  walk(node);
+  return items;
+}
+
+// Find ALL sections (anywhere in tree) whose TOCHeading matches keywords, optionally HSDB-only
+function findSectionsByKeywords(root, keywords, hsdbOnly = false) {
+  const results = [];
+  const normKeywords = keywords.map(k => k.toLowerCase());
+  
+  function walk(node) {
+    if (!node) return;
+    if (node.TOCHeading) {
+      const lower = node.TOCHeading.toLowerCase();
+      if (normKeywords.some(k => lower.includes(k))) {
+        if (!hsdbOnly || sectionLooksHsdb(node)) {
+          results.push(node);
+        }
+      }
+    }
+    if (node.Section) node.Section.forEach(walk);
+  }
+  walk(root);
+  return results;
+}
+
 function extractTableLikeSection(node, maxRows = 25) {
   const rows = [];
   if (!node?.Information) return rows;
@@ -212,18 +263,27 @@ const PUBCHEM_TOX_HEADINGS = [
   'RAIS Toxicity Values'
 ];
 
+// Headings where we want more data extracted (complex tox sections)
+const ENHANCED_HEADINGS = new Set([
+  'Genotoxicity', 'Reproductive Effects', 'Carcinogenicity',
+  'Skin, Eye, and Respiratory Irritations'
+]);
+
 function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
   const sections = {};
   for (const heading of PUBCHEM_TOX_HEADINGS) {
     const items = [];
+    const maxItems = ENHANCED_HEADINGS.has(heading) ? 12 : 6;
+    const maxChars = ENHANCED_HEADINGS.has(heading) ? 1400 : 1000;
+
     const a = findSection(toxRoot, heading);
     const b = findSection(ghsRoot, heading);
     const c = findSection(fullRoot, heading);
 
-    if (a) items.push(...extractItems(a));
-    if (b) items.push(...extractItems(b));
+    if (a) items.push(...extractItems(a, maxItems, maxChars));
+    if (b) items.push(...extractItems(b, maxItems - items.length, maxChars));
 
-    if (c) {
+    if (c && items.length < maxItems) {
       if (
         heading === 'EPA IRIS Information' ||
         heading === 'EPA Provisional Peer-Reviewed Toxicity Values' ||
@@ -231,12 +291,21 @@ function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
       ) {
         items.push(...extractTableLikeSection(c));
       } else {
-        items.push(...extractItems(c));
+        items.push(...extractItems(c, maxItems - items.length, maxChars));
       }
     }
 
     if (items.length) sections[heading] = items;
   }
+  
+  // Debug: log which headings produced data
+  const foundHeadings = Object.keys(sections);
+  const missingHeadings = PUBCHEM_TOX_HEADINGS.filter(h => !sections[h]);
+  console.log(`[ToxProfile] PubChem headings with data: ${foundHeadings.join(', ')}`);
+  if (missingHeadings.length) {
+    console.log(`[ToxProfile] PubChem headings WITHOUT data: ${missingHeadings.join(', ')}`);
+  }
+  
   return serializeSections(sections);
 }
 
@@ -330,6 +399,42 @@ function buildHsdbGroupsFromFullRecord(fullRoot) {
   const nonHumanComplete = get('Non-Human Toxicity Excerpts (Complete)');
   const animalStudies = get('Animal Toxicity Studies');
 
+  // --- Helper: multi-strategy extraction for a topic ---
+  // Strategy 1: prefix match on text (original approach)
+  // Strategy 2: sub-section heading match  
+  // Strategy 3: keyword-anywhere-in-text match
+  // Strategy 4: find ANY section in full tree with matching heading
+  // Returns first non-empty result
+  function extractTopic(parentNodes, prefixes, subHeadingKeywords, textKeywords, treeKeywords) {
+    // Strategy 1: prefix
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractPrefixedItems(node, prefixes, 10, 1400);
+      if (items.length) return items;
+    }
+    // Strategy 2: sub-section headings
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractSubSectionItems(node, subHeadingKeywords, 10, 1400);
+      if (items.length) return items;
+    }
+    // Strategy 3: keyword in text content
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractKeywordItems(node, textKeywords, 8, 1400);
+      if (items.length) return items;
+    }
+    // Strategy 4: find sections anywhere in full PUG-View tree
+    if (treeKeywords && fullRoot) {
+      const sections = findSectionsByKeywords(fullRoot, treeKeywords, false);
+      for (const sec of sections) {
+        const items = extractItems(sec, 8, 1400);
+        if (items.length) return items;
+      }
+    }
+    return [];
+  }
+
   const hsdb1 = mergeSections(
     ['Absorption, Distribution and Excretion', getItems('Absorption, Distribution and Excretion')],
     ['Absorption, Distribution and Excretion (Complete)', getItems('Absorption, Distribution and Excretion (Complete)')],
@@ -348,56 +453,61 @@ function buildHsdbGroupsFromFullRecord(fullRoot) {
     ['Non-Human Toxicity Values (Complete)', getItems('Non-Human Toxicity Values (Complete)')]
   );
 
+  // --- hsdb2: Irritation / Sensitization / Repeated dose ---
+  const irritSensItems = extractTopic(
+    [humanComplete],
+    ['/irritation', '/skin irritation', '/eye irritation', '/sensitization', '/allergic reactions', '/asthma'],
+    ['irritation', 'sensitization', 'allergic', 'skin sensitization', 'respiratory sensitization'],
+    ['sensitization', 'sensitisation', 'allergic contact', 'dermatitis', 'asthma', 'skin irritation'],
+    ['Skin Sensitization', 'Respiratory Sensitization', 'Sensitization']
+  );
+  const repeatedDoseAnimal = extractTopic(
+    [animalStudies, nonHumanComplete],
+    ['/laboratory animals: subchronic or prechronic exposure', '/laboratory animals: chronic exposure or carcinogenicity'],
+    ['subchronic', 'chronic exposure', 'prechronic'],
+    ['subchronic', 'repeated dose', 'chronic exposure', '90-day', '28-day', 'noael', 'loael'],
+    null
+  );
+
   const hsdb2 = mergeSections(
-    ['Human Toxicity Excerpts (Complete) - irritation/sensibilisation', humanComplete ? extractPrefixedItems(humanComplete, [
-      '/irritation',
-      '/skin irritation',
-      '/eye irritation',
-      '/sensitization',
-      '/allergic reactions',
-      '/asthma'
-    ]) : []],
-    ['Animal Toxicity Studies - repeated dose', animalStudies ? extractPrefixedItems(animalStudies, [
-      '/laboratory animals: subchronic or prechronic exposure',
-      '/laboratory animals: chronic exposure or carcinogenicity'
-    ]) : []],
-    ['Non-Human Toxicity Excerpts (Complete) - repeated dose', nonHumanComplete ? extractPrefixedItems(nonHumanComplete, [
-      '/laboratory animals: subchronic or prechronic exposure',
-      '/laboratory animals: chronic exposure or carcinogenicity'
-    ]) : []],
+    ['Irritation / Sensitization data', irritSensItems],
+    ['Animal Studies - repeated dose', repeatedDoseAnimal],
     ['Medical Surveillance', getItems('Medical Surveillance')],
     ['Medical Surveillance (Complete)', getItems('Medical Surveillance (Complete)')]
   );
 
+  // --- hsdb3: Genotoxicity / Carcinogenicity / Reprotox ---
+  const genotoxItems = extractTopic(
+    [humanComplete, nonHumanComplete],
+    ['/genotoxicity'],
+    ['genotoxicity', 'mutagenicity', 'genetic toxicology'],
+    ['genotoxic', 'mutagenic', 'ames test', 'chromosom', 'micronuclei', 'micronucleus', 'sister chromatid', 'dna damage', 'clastogen'],
+    ['Genotoxicity']
+  );
+  const reprotoxItems = extractTopic(
+    [humanComplete, nonHumanComplete, animalStudies],
+    ['/laboratory animals: developmental or reproductive toxicity'],
+    ['reproductive', 'developmental', 'teratogenicity', 'fertility', 'teratogenic'],
+    ['reproductive', 'teratogenic', 'fertility', 'embryo', 'fetal', 'foetal', 'developmental toxicity', 'birth defect', 'malformation'],
+    ['Reproductive Effects', 'Developmental Toxicity']
+  );
+
   const hsdb3 = mergeSections(
-    // --- Genotoxicity: direct HSDB sections ---
+    // Direct HSDB genotoxicity sections
     ['Genotoxicity', getItems('Genotoxicity')],
     ['Genotoxicity (Complete)', getItems('Genotoxicity (Complete)')],
-    // --- Genotoxicity: sub-sections within Human/Non-Human Toxicity Excerpts ---
-    ['Human Toxicity Excerpts (Complete) - genotoxicity', humanComplete ? extractSubSectionItems(humanComplete, [
-      'genotoxicity', 'mutagenicity', 'genetic toxicology'
-    ]) : []],
-    ['Non-Human Toxicity Excerpts (Complete) - genotoxicity', nonHumanComplete ? extractSubSectionItems(nonHumanComplete, [
-      'genotoxicity', 'mutagenicity', 'genetic toxicology'
-    ]) : []],
-    // --- Carcinogenicity ---
+    // Extracted genotox data from excerpts/tree
+    ['Genotoxicity data', genotoxItems],
+    // Carcinogenicity
     ['Evidence for Carcinogenicity', getItems('Evidence for Carcinogenicity')],
     ['Evidence for Carcinogenicity (Complete)', getItems('Evidence for Carcinogenicity (Complete)')],
-    // --- Reproductive/Developmental Toxicity: direct HSDB sections ---
+    // Direct HSDB reprotox sections
     ['Reproductive Effects', getItems('Reproductive Effects')],
     ['Reproductive Effects (Complete)', getItems('Reproductive Effects (Complete)')],
     ['Developmental Toxicity/Teratogenicity', getItems('Developmental Toxicity/Teratogenicity')],
     ['Developmental Toxicity/Teratogenicity (Complete)', getItems('Developmental Toxicity/Teratogenicity (Complete)')],
-    // --- Reprotox: sub-sections within Human/Non-Human Toxicity Excerpts ---
-    ['Human Toxicity Excerpts (Complete) - reprotox', humanComplete ? extractSubSectionItems(humanComplete, [
-      'reproductive', 'developmental', 'teratogenicity', 'fertility'
-    ]) : []],
-    ['Non-Human Toxicity Excerpts (Complete) - reprotox', nonHumanComplete ? extractSubSectionItems(nonHumanComplete, [
-      'reproductive', 'developmental', 'teratogenicity', 'fertility'
-    ]) : []],
-    ['Animal Toxicity Studies - reprotox', animalStudies ? extractSubSectionItems(animalStudies, [
-      'reproductive', 'developmental', 'teratogenicity', 'fertility'
-    ]) : []]
+    // Extracted reprotox data from excerpts/tree
+    ['Reproductive/Developmental data', reprotoxItems]
   );
 
   const hsdb4 = mergeSections(
