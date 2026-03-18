@@ -1,5 +1,5 @@
 // api/search-name.js — GET /api/search-name?q=benzene
-import { getClassDb, handleCors } from './_lib/shared.js';
+import { getClassDb, handleCors } from '../lib/shared.js';
 
 export default async function handler(req, res) {
   if (handleCors(req, res)) return;
