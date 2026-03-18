@@ -1,110 +1,134 @@
-# Toxonomy v2
+# Toxonomy v3
 
-> Classifications toxicologiques multi-agences — Refonte complète
+> Classifications toxicologiques multi-agences + profils toxicologiques IA
 
 ## Architecture
 
 ```
 toxonomy/
-├── server/
-│   └── index.js          # Backend Node.js (Express + better-sqlite3)
+├── api/                          # Vercel Serverless Functions
+│   ├── _lib/
+│   │   ├── shared.js             # Clients Turso, CAS utils, config sources
+│   │   └── toxProfile.js         # Génération profil tox (PubChem + OpenRouter)
+│   ├── export/
+│   │   ├── multiple.js           # Export multi-onglets (un par source)
+│   │   └── combined.js           # Export combiné (une ligne par CAS)
+│   ├── tox-profile/
+│   │   └── cache.js              # Stats du cache profil tox
+│   ├── vtr_export/
+│   │   └── xlsx.js               # Export VTR en XLSX
+│   ├── export.js                 # Export basique CSV/XLSX
+│   ├── search.js                 # Recherche classifications par CAS
+│   ├── search-name.js            # Autocomplete par nom de substance
+│   ├── sources.js                # Liste des sources disponibles
+│   ├── tox-profile.js            # Génération profil toxicologique
+│   └── vtr.js                    # Recherche VTR par CAS
+├── scripts/
+│   ├── build-turso-indexes.js    # Indexation Classifications (run once)
+│   └── build-vtr-index.js        # Indexation VTR (run once)
 ├── src/
 │   ├── components/
-│   │   ├── Header.jsx          # En-tête avec dark mode toggle
-│   │   ├── Sidebar.jsx         # Navigation latérale responsive
-│   │   ├── SearchPanel.jsx     # Panneau de recherche (CAS + nom + groupes)
-│   │   ├── SubstanceCard.jsx   # Carte résultat avec accordions
-│   │   ├── AnalyticsPanel.jsx  # Stats + barres de danger + filtres
-│   │   └── ClassificationMatrix.jsx  # Matrice croisée substances × sources
+│   │   ├── Header.jsx
+│   │   ├── Sidebar.jsx
+│   │   ├── SearchPanel.jsx
+│   │   ├── SubstanceCard.jsx
+│   │   ├── AnalyticsPanel.jsx
+│   │   └── ClassificationMatrix.jsx
 │   ├── pages/
-│   │   ├── ClassificationsPage.jsx   # Page principale
-│   │   ├── VTRPage.jsx               # Valeurs de référence
-│   │   └── DocumentationPage.jsx     # Documentation des sources
+│   │   ├── ClassificationsPage.jsx
+│   │   ├── VTRPage.jsx
+│   │   └── DocumentationPage.jsx
 │   ├── hooks/
-│   │   └── useSearch.js        # Hooks (search, dark mode, URL sync, name search)
+│   │   └── useSearch.js
 │   ├── utils/
-│   │   ├── api.js              # Utilitaires API + constantes
-│   │   └── sources.js          # Configuration des sources
+│   │   ├── api.js
+│   │   └── sources.js
 │   ├── App.jsx
 │   ├── main.jsx
-│   └── index.css               # Design tokens CSS (light/dark)
+│   └── index.css
 ├── index.html
 ├── package.json
+├── vercel.json
 ├── vite.config.js
 ├── tailwind.config.js
 └── postcss.config.js
 ```
 
-## Changements par rapport à v1
+## Stack
+
+- **Frontend** : React 18 + Vite + Tailwind CSS
+- **Backend** : Vercel Serverless Functions (Node.js)
+- **Base de données** : Turso (libSQL hébergé)
+- **LLM** : OpenRouter (profils toxicologiques)
+- **Données** : PubChem PUG-View API (toxicité, GHS, HSDB)
+
+## Changements v2 → v3
+
+### Infrastructure
+- **Render → Vercel** : serverless, plus de serveur persistant
+- **SQLite local → Turso** : base de données hébergée, accès HTTP
+- **R2/B2 supprimé** : les données sont directement dans Turso
+- **Index en mémoire → tables de lookup** : `cas_lookup`, `name_lookup`, `vtr_cas_lookup` persistées dans Turso
 
 ### Backend
-- **Python/Flask → Node.js/Express** avec `better-sqlite3` (5-10x plus rapide)
-- **Index CAS en mémoire** construit au démarrage : recherche O(1) au lieu de scan O(n×tables)
-- **Recherche par nom** de substance (endpoint GET /api/search-name)
-- **ExcelJS** pour les exports (remplace pandas/xlsxwriter)
-- Même logique Backblaze B2 pour télécharger les DB
+- **Express → Vercel Functions** : chaque route est un fichier indépendant dans `api/`
+- **better-sqlite3 → @libsql/client** : client HTTP vers Turso
+- **Requêtes batch** : `batchGetCasLookup` et `getSubstanceNames` récupèrent toutes les données en 2 requêtes au lieu de N×M
+- **ExcelJS via writeBuffer()** : compatible serverless (pas de streaming)
 
-### Frontend
-- **Composants modulaires** (7 composants au lieu d'un monolithe de 600 lignes)
-- **react-router-dom** pour la navigation et les URLs partageables
-- **URL sync** : les CAS et groupes sont encodés dans l'URL
-- **Recherche par nom** avec auto-complétion debounced
-- **Filtres par danger** : cliquer sur une barre dans le panneau analytics
-- **Matrice de classification** : vue croisée substances × sources
-- **Design tokens CSS** pour un dark mode propre
-- **Mobile-first** : sidebar responsive, cartes VTR en mode card sur mobile
-- **Skeleton loading** pendant les requêtes
-- **Typographie distinctive** : DM Sans + Instrument Serif
-
-### Fonctionnalités nouvelles
-- Recherche par nom de substance
-- Filtres par type de danger (cancérogène, mutagène, etc.)
-- URLs partageables avec paramètres de recherche
-- Matrice de classification visuelle
-- Interface mobile complète
+### Profils toxicologiques
+- **Gemini → OpenRouter** : modèle configurable avec fallback
+- **4 prompts parallèles** : extraction PubChem/HSDB + génération par sections ECHA/REACH
 
 ## Installation
 
 ### Prérequis
 - Node.js 18+
-- Les fichiers `Classifications.db` et `VTR.db` (Backblaze)
+- Compte Vercel
+- Bases Turso (Classifications + VTR)
 
-### Variables d'environnement
+### Variables d'environnement (Vercel Dashboard)
+
 ```env
-B2_ENDPOINT=https://s3.eu-central-003.backblazeb2.com
-B2_BUCKET=your-bucket
-B2_KEY_ID_RO=your-key
-B2_APP_KEY_RO=your-secret
-B2_PREFIX=db/
-PORT=5000
+TURSO_CLASSIFICATIONS_URL=libsql://...
+TURSO_CLASSIFICATIONS_TOKEN=...
+TURSO_VTR_URL=libsql://...
+TURSO_VTR_TOKEN=...
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openrouter/hunter-alpha    # optionnel
 ```
+
+### Indexation initiale (une seule fois)
+
+Après avoir chargé les données dans Turso, lancer les scripts d'indexation :
+
+```bash
+npm install @libsql/client
+
+TURSO_CLASSIFICATIONS_URL=... TURSO_CLASSIFICATIONS_TOKEN=... \
+  node scripts/build-turso-indexes.js
+
+TURSO_VTR_URL=... TURSO_VTR_TOKEN=... \
+  node scripts/build-vtr-index.js
+```
+
+Ces scripts créent les tables `cas_lookup`, `name_lookup` et `vtr_cas_lookup` utilisées par les API routes pour des recherches indexées.
+
+### Déploiement
+
+1. Push sur GitHub
+2. Importer le repo dans Vercel (framework : Vite)
+3. Ajouter les variables d'environnement
+4. Deploy automatique à chaque push
 
 ### Dev local
+
 ```bash
 npm install
-
-# Terminal 1 : backend
-node server/index.js
-
-# Terminal 2 : frontend
-npm run dev
+vercel dev
 ```
 
-Le proxy Vite redirige `/api` vers `localhost:5000`.
-
-### Build production
-```bash
-npm run build     # Génère dist/
-npm start         # Lance le serveur qui sert dist/ + API
-```
-
-### Déploiement Render
-1. Push sur GitHub
-2. Créer un Web Service sur Render :
-   - **Build command**: `npm install && npm run build`
-   - **Start command**: `node server/index.js`
-   - Ajouter les variables d'environnement B2_*
-3. Le serveur télécharge les DB au premier démarrage et sert le frontend statique
+Les API routes et le frontend Vite sont servis ensemble par `vercel dev`.
 
 ## API Endpoints
 
@@ -114,10 +138,15 @@ npm start         # Lance le serveur qui sert dist/ + API
 | GET | `/api/search-name?q=benzene` | Recherche par nom (autocomplete) |
 | POST | `/api/search` | Recherche classifications par CAS |
 | POST | `/api/vtr` | Recherche VTR par CAS |
-| POST | `/api/export` | Export XLSX/CSV des classifications |
-| POST | `/api/vtr_export/xlsx` | Export XLSX des VTR |
+| POST | `/api/export` | Export basique CSV/XLSX |
+| POST | `/api/export/multiple` | Export multi-onglets XLSX |
+| POST | `/api/export/combined` | Export combiné XLSX |
+| POST | `/api/vtr_export/xlsx` | Export VTR en XLSX |
+| POST | `/api/tox-profile` | Génération profil toxicologique |
+| GET | `/api/tox-profile/cache` | Stats du cache |
 
 ### Exemple POST /api/search
+
 ```json
 {
   "cas_numbers": ["71-43-2", "50-00-0"],
