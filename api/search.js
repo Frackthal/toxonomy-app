@@ -2,7 +2,7 @@
 import {
   getClassDb, normalizeCas, handleCors,
   VALID_TABLES, batchGetCasLookup, getSubstanceNames, processRow,
-} from './_lib/shared.js';
+} from '../lib/shared.js';
 
 export default async function handler(req, res) {
   if (handleCors(req, res)) return;
