@@ -8,10 +8,7 @@
   ],
   "functions": {
     "api/**/*.js": {
-      "maxDuration": 30
-    },
-    "api/tox-profile.js": {
-      "maxDuration": 120
+      "maxDuration": 60
     }
   }
 }
