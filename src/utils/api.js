@@ -1,9 +1,8 @@
-const API_BASE = import.meta.env.PROD
-  ? '/api'
-  : 'http://localhost:5000/api';
+// src/utils/api.js — Frontend API utilities (Vercel edition)
+// On Vercel, API routes are at /api/* in both dev and prod
 
 export async function apiPost(endpoint, body) {
-  const res = await fetch(`${API_BASE}${endpoint}`, {
+  const res = await fetch(`/api${endpoint}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -13,13 +12,13 @@ export async function apiPost(endpoint, body) {
 }
 
 export async function apiGet(endpoint) {
-  const res = await fetch(`${API_BASE}${endpoint}`);
+  const res = await fetch(`/api${endpoint}`);
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
 }
 
 export async function apiDownload(endpoint, body, filename) {
-  const res = await fetch(`${API_BASE}${endpoint}`, {
+  const res = await fetch(`/api${endpoint}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
