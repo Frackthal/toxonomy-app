@@ -3,7 +3,7 @@ import ExcelJS from 'exceljs';
 import {
   getClassDb, normalizeCas, handleCors,
   VALID_TABLES, EXCLUDED_COLUMNS, findRowsByCas, getSubstanceName, isClassified,
-} from '../lib/shared.js';
+} from from '../../lib/shared.js';
 
 export default async function handler(req, res) {
   if (handleCors(req, res)) return;
