@@ -1,0 +1,29 @@
+name: Build Turso Indexes
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-indexes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install @libsql/client
+        run: npm install @libsql/client
+
+      - name: Build Classifications indexes
+        env:
+          TURSO_CLASSIFICATIONS_URL: ${{ secrets.TURSO_CLASSIFICATIONS_URL }}
+          TURSO_CLASSIFICATIONS_TOKEN: ${{ secrets.TURSO_CLASSIFICATIONS_TOKEN }}
+        run: node scripts/build-turso-indexes.js
+
+      - name: Build VTR index
+        env:
+          TURSO_VTR_URL: ${{ secrets.TURSO_VTR_URL }}
+          TURSO_VTR_TOKEN: ${{ secrets.TURSO_VTR_TOKEN }}
+        run: node scripts/build-vtr-index.js
