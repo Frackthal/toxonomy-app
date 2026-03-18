@@ -1,6 +1,6 @@
 // api/vtr_export/xlsx.js — POST /api/vtr_export/xlsx
 import ExcelJS from 'exceljs';
-import { getVtrDb, normalizeCas, handleCors } from '../_lib/shared.js';
+import { getVtrDb, normalizeCas, handleCors } from '../../lib/shared.js';
 
 const VTR_HIDDEN = new Set(['id', 'source_system', 'raw_source']);
 
