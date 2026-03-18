@@ -1,6 +1,6 @@
 // api/tox-profile.js — POST /api/tox-profile
-import { handleCors } from './_lib/shared.js';
-import { generateToxProfile } from './_lib/toxProfile.js';
+import { handleCors } from '../lib/shared.js';
+import { generateToxProfile } from '../lib/toxProfile.js';
 
 export default async function handler(req, res) {
   if (handleCors(req, res)) return;
