@@ -1,5 +1,5 @@
 // api/vtr.js — POST /api/vtr
-import { getVtrDb, getClassDb, normalizeCas, getSubstanceNames, handleCors } from './_lib/shared.js';
+import { getVtrDb, getClassDb, normalizeCas, getSubstanceNames, handleCors } from '../lib/shared.js';
 
 const VTR_HIDDEN = new Set(['id', 'source_system', 'raw_source']);
 
