@@ -900,8 +900,9 @@ async function callOpenRouter(prompt) {
 
 const COMMON_RULES = `Règles impératives :
 - Réponds uniquement en JSON valide, sans backticks ni texte autour.
-- N'invente aucune donnée. Utilise uniquement les données fournies ci-dessous.
-- Si les données sont insuffisantes pour une section, renvoie available=false et content="Données non disponibles dans les sources consultées."
+- N'invente aucune donnée. Utilise les données fournies dans TOUTES les sections ci-dessous (PubChem ET HSDB).
+- Cherche les informations pertinentes dans l'ENSEMBLE des données, même si elles apparaissent dans une section inattendue.
+- Si AUCUNE donnée pertinente n'est trouvée dans aucune des sources fournies, renvoie available=false et content="Données non disponibles dans les sources consultées."
 - Sois synthétique mais précis (5-15 phrases par section quand les données le permettent).
 - Rédige en français.
 - Conserve exactement les clés JSON demandées.`;
@@ -925,9 +926,9 @@ JSON attendu :
   }
 }
 
-=== DONNÉES PUBCHEM (toxicité, GHS) ===
+=== DONNÉES PUBCHEM (toutes données toxicologiques disponibles) ===
 ${pubchemText}
-=== DONNÉES HSDB (ADME, Pharmacologie, Toxicité aiguë, Valeurs DL50/CL50) ===
+=== DONNÉES HSDB COMPLÉMENTAIRES (ADME, pharmacologie, toxicité aiguë, DL50/CL50) ===
 ${hsdbText || 'Non disponible'}`;
 }
 
@@ -955,10 +956,11 @@ JSON attendu :
   }
 }
 
-=== DONNÉES PUBCHEM (toxicité, GHS) ===
+=== DONNÉES PUBCHEM (toutes données toxicologiques disponibles) ===
 ${pubchemText}
-=== DONNÉES HSDB (Irritation, Sensibilisation, Doses répétées, Surveillance médicale) ===
-${hsdbText || 'Non disponible'}`;
+=== DONNÉES HSDB COMPLÉMENTAIRES (irritation, sensibilisation, doses répétées si disponibles) ===
+${hsdbText || 'Non disponible'}
+=== IMPORTANT : Chercher les données de sensibilisation dans TOUTES les sections ci-dessus, y compris dans les excerpts de toxicité humaine et les données GHS. ===`;
 }
 
 function buildPrompt3(substanceName, cas, pubchemText, hsdbText) {
@@ -985,10 +987,11 @@ JSON attendu :
   }
 }
 
-=== DONNÉES PUBCHEM (toxicité, GHS) ===
+=== DONNÉES PUBCHEM (toutes données toxicologiques disponibles) ===
 ${pubchemText}
-=== DONNÉES HSDB (Génotoxicité, Cancérogénicité, Reproduction, Développement) ===
-${hsdbText || 'Non disponible'}`;
+=== DONNÉES HSDB COMPLÉMENTAIRES (génotoxicité, cancérogénicité, reproduction si disponibles) ===
+${hsdbText || 'Non disponible'}
+=== IMPORTANT : Chercher les données de génotoxicité et de toxicité reproductive dans TOUTES les sections ci-dessus, y compris dans les excerpts de toxicité humaine et animale. ===`;
 }
 
 function buildPrompt4(substanceName, cas, pubchemText, hsdbText) {
@@ -1010,9 +1013,9 @@ JSON attendu :
   }
 }
 
-=== DONNÉES PUBCHEM (toxicité, GHS, VTR) ===
+=== DONNÉES PUBCHEM (toutes données toxicologiques disponibles) ===
 ${pubchemText}
-=== DONNÉES HSDB / PUBCHEM (Standards professionnels, NIOSH, VTR) ===
+=== DONNÉES HSDB COMPLÉMENTAIRES (standards professionnels, NIOSH, VTR) ===
 ${hsdbText || 'Non disponible'}`;
 }
 
