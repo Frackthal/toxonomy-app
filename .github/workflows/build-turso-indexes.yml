@@ -16,11 +16,7 @@ jobs:
       - name: Install @libsql/client
         run: npm install @libsql/client
 
-      - name: Build Classifications indexes
-        env:
-          TURSO_CLASSIFICATIONS_URL: ${{ secrets.TURSO_CLASSIFICATIONS_URL }}
-          TURSO_CLASSIFICATIONS_TOKEN: ${{ secrets.TURSO_CLASSIFICATIONS_TOKEN }}
-        run: node scripts/build-turso-indexes.js
+
 
       - name: Build VTR index
         env:
