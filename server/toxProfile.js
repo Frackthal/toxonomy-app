@@ -4,8 +4,8 @@
 // Signature conservée : generateToxProfile(cas)
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-super:free';
-const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || 'arcee-ai/trinity-large-preview:free,stepfun/step-3.5-flash:free')
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || '';
+const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
@@ -199,30 +199,36 @@ function extractByInfoName(node, nameKeywords, maxItems = 10, maxChars = 1400) {
 }
 
 /**
- * Extract items where text content matches prefixes (tag-like markers).
+ * Extract items where text content OR Information.Name matches prefixes.
  * HSDB text paragraphs in "Human Health Effects" and "Non-Human Toxicity Excerpts"
- * sections often start with prefix tags like:
- *   /SIGNS AND SYMPTOMS/
- *   /LABORATORY ANIMALS: Acute exposure/
- *   /GENOTOXICITY/
- *   /IMMUNOTOXICITY/
- * etc.
+ * sections use tag prefixes in TWO ways:
+ *   A) Text starts with tag: "/GENOTOXICITY/ Formaldehyde is genotoxic..."
+ *   B) Information.Name field IS the tag: Name="/GENOTOXICITY/" with text in StringWithMarkup
+ * We check both.
  */
 function extractPrefixedItems(node, prefixes, maxItems = 10, maxChars = 1400) {
   const items = [];
-  const normPrefixes = prefixes.map(p => p.toLowerCase());
+  const normPrefixes = prefixes.map(p => p.toLowerCase().replace(/^\//, '').replace(/\/$/, ''));
+
+  function matchesPrefix(text) {
+    const lower = text.trim().toLowerCase().replace(/^\//, '');
+    return normPrefixes.some(p => lower.startsWith(p));
+  }
 
   function walk(n) {
     if (!n || items.length >= maxItems) return;
     if (n.Information) {
       for (const inf of n.Information) {
         if (items.length >= maxItems) break;
+        const name = String(inf.Name || '').trim();
+        const nameMatches = name && matchesPrefix(name);
         const strings = inf.Value?.StringWithMarkup?.map(s => s.String).filter(s => s && s.length > 10) || [];
         const ref = formatRef(inf.Reference?.[0] || '');
+        
         for (const str of strings) {
           if (items.length >= maxItems) break;
-          const lower = str.trim().toLowerCase();
-          if (!normPrefixes.some(p => lower.startsWith(p))) continue;
+          // Match if text starts with prefix OR if Name field matches
+          if (!nameMatches && !matchesPrefix(str)) continue;
           const text = str.length > maxChars ? str.substring(0, maxChars) + '…' : str;
           items.push({ text: text.trim(), ref });
         }
@@ -516,6 +522,19 @@ function mergeSections(...entries) {
 }
 
 /**
+ * Deduplicate items by text content (first 100 chars).
+ */
+function deduplicateItems(items) {
+  const seen = new Set();
+  return items.filter(item => {
+    const key = item.text.substring(0, 100).toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/**
  * Multi-strategy topic extractor.
  * Tries in order:
  *   1. Prefix-matched text in parent nodes (HSDB tagged paragraphs)
@@ -628,6 +647,8 @@ function buildHsdbGroups(fullRoot) {
   const allAnimalSources = [animalStudies, nonHumanExcerpts].filter(Boolean);
   const allSources = [...allHumanSources, ...allAnimalSources];
 
+  console.log(`[ToxProfile] HSDB parent nodes: humanExcerpts=${!!humanExcerpts}, humanHealth=${!!humanHealth}, nonHumanExcerpts=${!!nonHumanExcerpts}, animalStudies=${!!animalStudies}`);
+
   // ── Group 1: Toxicokinetics (ADME) + Acute Toxicity ──
   const hsdb1 = mergeSections(
     ['Absorption, Distribution and Excretion', getItems('Absorption, Distribution and Excretion')],
@@ -662,24 +683,38 @@ function buildHsdbGroups(fullRoot) {
   );
 
   // ── Group 2: Irritation / Sensitization / Repeated dose ──
-  const irritSensItems = extractTopic(fullRoot, allSources, {
+  const irritItems = extractTopic(fullRoot, allSources, {
     prefixes: [
       '/skin, eye and respiratory irritation',
       '/irritation', '/skin irritation', '/eye irritation',
+    ],
+    subHeadingKeywords: ['irritation', 'corrosion'],
+    textKeywords: [
+      'skin irritation', 'eye irritation', 'respiratory irritation',
+      'corrosive', 'draize',
+    ],
+    infoNameKeywords: ['irritation', 'corros'],
+    treeKeywords: ['Skin, Eye, and Respiratory Irritations', 'Irritation'],
+  });
+
+  // Sensitization: search broadly — HSDB tagged paragraphs + full tree
+  const sensItems = extractTopic(fullRoot, allSources, {
+    prefixes: [
       '/sensitization', '/allergic reactions', '/allergic contact',
-      '/immunotoxicity',
+      '/immunotoxicity', '/skin sensitization', '/respiratory sensitization',
     ],
     subHeadingKeywords: [
-      'irritation', 'sensitization', 'sensitisation', 'allergic',
+      'sensitization', 'sensitisation', 'allergic',
       'skin sensitization', 'respiratory sensitization', 'immunotoxicity',
     ],
     textKeywords: [
       'sensitization', 'sensitisation', 'allergic contact', 'dermatitis',
-      'asthma', 'skin irritation', 'eye irritation', 'respiratory irritation',
-      'immunotoxic',
+      'asthma', 'immunotoxic', 'contact allergy', 'skin allergy',
+      'respiratory allergy', 'occupational asthma', 'LLNA', 'guinea pig maximization',
+      'patch test',
     ],
-    infoNameKeywords: ['irritation', 'sensitiz', 'allerg', 'immunotox'],
-    treeKeywords: ['Skin Sensitization', 'Respiratory Sensitization', 'Sensitization', 'Irritation'],
+    infoNameKeywords: ['sensitiz', 'allerg', 'immunotox', 'asthma'],
+    treeKeywords: ['Skin Sensitization', 'Respiratory Sensitization', 'Sensitization'],
   });
 
   const repeatedDoseItems = extractTopic(fullRoot, allAnimalSources, {
@@ -696,8 +731,11 @@ function buildHsdbGroups(fullRoot) {
     infoNameKeywords: ['subchronic', 'chronic', 'repeated', 'noael', 'loael'],
   });
 
+  console.log(`[ToxProfile] HSDB Group 2 extraction: irrit=${irritItems.length}, sens=${sensItems.length}, repeated=${repeatedDoseItems.length} items`);
+
   const hsdb2 = mergeSections(
-    ['Irritation / Sensitization data', irritSensItems],
+    ['Irritation data', irritItems],
+    ['Sensitization data', sensItems],
     ['Animal Studies - repeated dose', repeatedDoseItems],
     ['Medical Surveillance', getItems('Medical Surveillance')],
     ['Medical Surveillance (Complete)', getItems('Medical Surveillance (Complete)')],
@@ -707,12 +745,13 @@ function buildHsdbGroups(fullRoot) {
 
   // ── Group 3: Genotoxicity / Carcinogenicity / Reprotox ──
   
-  // Genotoxicity: try direct HSDB sections first, then tagged paragraphs
+  // Genotoxicity: combine direct HSDB sections + tagged paragraphs + full tree
   const directGenotox = [
     ...getItems('Genotoxicity'),
     ...getItems('Genotoxicity (Complete)'),
   ];
-  const extractedGenotox = directGenotox.length ? [] : extractTopic(fullRoot, allSources, {
+  // Always try extraction from human/animal excerpts (not just as fallback)
+  const extractedGenotox = extractTopic(fullRoot, allSources, {
     prefixes: ['/genotoxicity', '/mutagenicity', '/alternative and in vitro tests'],
     subHeadingKeywords: ['genotoxicity', 'mutagenicity', 'genetic toxicology'],
     textKeywords: [
@@ -724,39 +763,42 @@ function buildHsdbGroups(fullRoot) {
     treeKeywords: ['Genotoxicity', 'Mutagenicity'],
   });
 
-  // Reprotox: try direct sections, then tagged paragraphs
+  // Reprotox: combine direct sections + tagged paragraphs + full tree
   const directReprotox = [
     ...getItems('Reproductive Effects'),
     ...getItems('Reproductive Effects (Complete)'),
     ...getItems('Developmental Toxicity/Teratogenicity'),
     ...getItems('Developmental Toxicity/Teratogenicity (Complete)'),
   ];
-  const extractedReprotox = directReprotox.length ? [] : extractTopic(fullRoot, allSources, {
+  const extractedReprotox = extractTopic(fullRoot, allSources, {
     prefixes: [
       '/laboratory animals: developmental or reproductive toxicity',
-      '/reproductive',
+      '/reproductive', '/developmental',
     ],
     subHeadingKeywords: ['reproductive', 'developmental', 'teratogenicity', 'fertility'],
     textKeywords: [
       'reproductive', 'teratogenic', 'fertility', 'embryo', 'fetal', 'foetal',
       'developmental toxicity', 'birth defect', 'malformation', 'spermatogenesis',
+      'menstrual', 'ovarian', 'testicular',
     ],
     infoNameKeywords: ['reproduct', 'teratogen', 'developmental', 'fertility', 'embryo'],
     treeKeywords: ['Reproductive Effects', 'Developmental Toxicity'],
   });
 
+  // Deduplicate: if direct and extracted overlap, keep unique texts
+  const allGenotox = deduplicateItems([...directGenotox, ...extractedGenotox]);
+  const allReprotox = deduplicateItems([...directReprotox, ...extractedReprotox]);
+
+  console.log(`[ToxProfile] HSDB Group 3 extraction: genotox=${allGenotox.length} items, reprotox=${allReprotox.length} items`);
+
   const hsdb3 = mergeSections(
-    // Direct HSDB genotoxicity sections
-    ['Genotoxicity', directGenotox],
-    // Extracted genotoxicity from excerpts/tree
-    ['Genotoxicity data (extracted)', extractedGenotox],
+    // Combined genotoxicity data
+    ['Genotoxicity data', allGenotox],
     // Carcinogenicity
     ['Evidence for Carcinogenicity', getItems('Evidence for Carcinogenicity')],
     ['Evidence for Carcinogenicity (Complete)', getItems('Evidence for Carcinogenicity (Complete)')],
-    // Direct HSDB reprotox sections
-    ['Reproductive Effects', directReprotox],
-    // Extracted reprotox from excerpts/tree
-    ['Reproductive/Developmental data (extracted)', extractedReprotox],
+    // Combined reprotox data
+    ['Reproductive/Developmental data', allReprotox],
   );
 
   // ── Group 4: Human data / Occupational standards / Reference values ──
