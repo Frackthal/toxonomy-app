@@ -1,13 +1,13 @@
 // server/toxProfile.js
-// Profil toxicologique via PubChem + HSDB (Complete) + OpenRouter
-// v9 — Utilise l'API Annotations HSDB pour les données complètes (pas tronquées)
+// Profil toxicologique via PubChem PUG-View + OpenRouter
+// v10 — Self-contained, pas de dépendance hsdbFetch
+// PubChem enrichi (GHS, MoA, VTR, classifications) + HSDB tronqué (5 items/section)
+// TODO: option BDD HSDB locale pour données complètes sans OOM
 // Signature conservée : generateToxProfile(cas)
 
-import { fetchHsdbComplete } from './hsdbFetch.js';
-
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-super-120b-a12b:free';
-const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || 'arcee-ai/trinity-large-preview:free,stepfun/step-3.5-flash:free')
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || '';
+const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
@@ -329,15 +329,24 @@ function serializeSections(sections) {
 // ─── Build PubChem Toxicity text ──────────────────────────────────────────────
 
 const PUBCHEM_TOX_HEADINGS = [
-  // Only sections NOT covered by HSDB complete data
+  // Core tox data
   'Hazards Summary',
+  'Health Effects',
+  'Non-Human Toxicity Values',
+  'Skin, Eye, and Respiratory Irritations',
+  'Human Toxicity Excerpts',
+  'Non-Human Toxicity Excerpts',
+  // Classifications (contain genotox/reprotox/sensitization info)
   'GHS Classification',
   'Hazard Classes and Categories',
   'Carcinogen Classification',
   'Adverse Effects',
   'Target Organs',
-  'Non-Human Toxicity Values',
-  // VTR (critical, not in HSDB)
+  // Mechanism & context
+  'Mechanism of Action',
+  'Toxicity Summary',
+  'Effects of Long Term Exposure',
+  // VTR (critical)
   'EPA IRIS Information',
   'EPA Provisional Peer-Reviewed Toxicity Values',
   'RAIS Toxicity Values',
@@ -347,14 +356,16 @@ const PUBCHEM_TOX_HEADINGS = [
 
 const ENHANCED_HEADINGS = new Set([
   'GHS Classification', 'Hazard Classes and Categories',
+  'Mechanism of Action', 'Toxicity Summary',
+  'Human Toxicity Excerpts', 'Non-Human Toxicity Excerpts',
 ]);
 
 function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
   const sections = {};
   for (const heading of PUBCHEM_TOX_HEADINGS) {
     const items = [];
-    const maxItems = ENHANCED_HEADINGS.has(heading) ? 8 : 4;
-    const maxChars = 600;
+    const maxItems = ENHANCED_HEADINGS.has(heading) ? 8 : 5;
+    const maxChars = 800;
 
     const a = findSection(toxRoot, heading);
     const b = findSection(ghsRoot, heading);
@@ -1023,13 +1034,12 @@ export async function generateToxProfile(cas) {
 
   console.log(`[ToxProfile] CAS ${normalizedCas} → CID ${cid}. Fetching data…`);
 
-  // Fetch PubChem data (PUG-View) and HSDB complete data (Annotations API) in parallel
-  const [props, toxData, ghsData, fullData, hsdbComplete] = await Promise.all([
+  // Fetch PubChem data only (HSDB via Annotations API was too heavy for 512MB Render)
+  const [props, toxData, ghsData, fullData] = await Promise.all([
     getPubchemProps(cid),
     fetchPugView(cid, 'Toxicity'),
     fetchPugView(cid, 'GHS Classification'),
     fetchFullPugView(cid),
-    fetchHsdbComplete(cid),
   ]);
 
   const substanceName = props.IUPACName || normalizedCas;
@@ -1037,43 +1047,21 @@ export async function generateToxProfile(cas) {
   const ghsRoot = ghsData?.Record || null;
   const fullRoot = fullData?.Record || null;
 
-  // Build PubChem text from PUG-View (GHS, Mechanism of Action, etc.)
+  // Build enriched PubChem text (GHS, MoA, VTR, classifications, etc.)
   const pubchemText = buildPubchemText(toxRoot, ghsRoot, fullRoot);
-  
-  // Use HSDB complete data (from Annotations API, not truncated)
-  const { hsdb1, hsdb2, hsdb3, hsdb4, stats: hsdbStats } = hsdbComplete;
+  // Build HSDB groups from full PUG-View (truncated to 5 items/section by PubChem)
+  const { hsdb1, hsdb2, hsdb3, hsdb4, foundHeadings } = buildHsdbGroups(fullRoot);
 
   console.log(`[ToxProfile] PubChem text: ${pubchemText.length} chars`);
-  console.log(`[ToxProfile] HSDB complete: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
-  console.log(`[ToxProfile] HSDB stats: ${JSON.stringify(hsdbStats)}`);
-
-  // Safety: truncate data if combined size is too large for LLM context
-  // Target: ~20K chars max per prompt (~6K tokens) to leave room for output
-  const MAX_DATA_CHARS = 20000;
-  function truncateData(pub, hsdb) {
-    const total = pub.length + hsdb.length;
-    if (total <= MAX_DATA_CHARS) return { pub, hsdb };
-    // Prioritize HSDB (more specific), truncate pubchem first
-    const pubBudget = Math.max(3000, MAX_DATA_CHARS - hsdb.length);
-    const truncPub = pub.length > pubBudget ? pub.substring(0, pubBudget) + '\n[… tronqué]' : pub;
-    const hsdbBudget = MAX_DATA_CHARS - truncPub.length;
-    const truncHsdb = hsdb.length > hsdbBudget ? hsdb.substring(0, hsdbBudget) + '\n[… tronqué]' : hsdb;
-    return { pub: truncPub, hsdb: truncHsdb };
-  }
-
-  const d1 = truncateData(pubchemText, hsdb1);
-  const d2 = truncateData(pubchemText, hsdb2);
-  const d3 = truncateData(pubchemText, hsdb3);
-  const d4 = truncateData(pubchemText, hsdb4);
-
-  console.log(`[ToxProfile] Prompt sizes (pub+hsdb): P1=${d1.pub.length+d1.hsdb.length}, P2=${d2.pub.length+d2.hsdb.length}, P3=${d3.pub.length+d3.hsdb.length}, P4=${d4.pub.length+d4.hsdb.length}`);
+  console.log(`[ToxProfile] HSDB groups: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
+  console.log(`[ToxProfile] HSDB headings: ${foundHeadings.join(', ') || '(none)'}`);
   console.log('[ToxProfile] Sending 4 parallel prompts to OpenRouter…');
 
   const [result1, result2, result3, result4] = await Promise.all([
-    callOpenRouter(buildPrompt1(substanceName, normalizedCas, d1.pub, d1.hsdb)),
-    callOpenRouter(buildPrompt2(substanceName, normalizedCas, d2.pub, d2.hsdb)),
-    callOpenRouter(buildPrompt3(substanceName, normalizedCas, d3.pub, d3.hsdb)),
-    callOpenRouter(buildPrompt4(substanceName, normalizedCas, d4.pub, d4.hsdb)),
+    callOpenRouter(buildPrompt1(substanceName, normalizedCas, pubchemText, hsdb1)),
+    callOpenRouter(buildPrompt2(substanceName, normalizedCas, pubchemText, hsdb2)),
+    callOpenRouter(buildPrompt3(substanceName, normalizedCas, pubchemText, hsdb3)),
+    callOpenRouter(buildPrompt4(substanceName, normalizedCas, pubchemText, hsdb4)),
   ]);
 
   const sectionOrder = [
