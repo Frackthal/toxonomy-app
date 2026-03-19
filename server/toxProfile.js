@@ -1,7 +1,9 @@
 // server/toxProfile.js
-// Profil toxicologique via PubChem + full PUG-View + OpenRouter
-// v8 — Extraction HSDB améliorée + choix modèles gratuits optimisé
+// Profil toxicologique via PubChem + HSDB (Complete) + OpenRouter
+// v9 — Utilise l'API Annotations HSDB pour les données complètes (pas tronquées)
 // Signature conservée : generateToxProfile(cas)
+
+import { fetchHsdbComplete } from './hsdbFetch.js';
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || '';
@@ -327,33 +329,56 @@ function serializeSections(sections) {
 // ─── Build PubChem Toxicity text ──────────────────────────────────────────────
 
 const PUBCHEM_TOX_HEADINGS = [
+  // Core tox sections
   'Acute Effects',
   'Non-Human Toxicity Values',
   'Exposure Routes',
   'Symptoms',
   'Human Toxicity Excerpts',
+  'Non-Human Toxicity Excerpts',
   'Health Effects',
   'First Aid',
-  'Inhalation First Aid',
-  'Skin First Aid',
-  'Eye First Aid',
-  'Ingestion First Aid',
-  'Top Hazards',
-  'Classes and Categories',
   'Hazards Summary',
   'Skin, Eye, and Respiratory Irritations',
   'Carcinogenicity',
   'Genotoxicity',
   'Reproductive Effects',
+  // VTR sections
   'EPA IRIS Information',
   'EPA Provisional Peer-Reviewed Toxicity Values',
   'RAIS Toxicity Values',
+  // NEW: sections where genotox/reprotox/sensitization data ACTUALLY lives
+  // (PubChem truncates HSDB excerpts to 5 items, so these sections are crucial)
+  'GHS Classification',
+  'Hazard Classes and Categories',
+  'Mechanism of Action',
+  'Evidence for Carcinogenicity',
+  'Carcinogen Classification',
+  'Signs and Symptoms',
+  'Target Organs',
+  'Cancer Sites',
+  'Adverse Effects',
+  'Toxicity Summary',
+  'Effects of Short Term Exposure',
+  'Effects of Long Term Exposure',
+  'Populations at Special Risk',
+  'TSCA Test Submissions',
+  'Reported Fatal Dose',
+  'Threshold Limit Values (TLV)',
+  'Medical Surveillance',
+  'NIOSH Recommendations',
 ];
 
 // Headings where we want more data extracted (complex tox sections)
 const ENHANCED_HEADINGS = new Set([
   'Genotoxicity', 'Reproductive Effects', 'Carcinogenicity',
   'Skin, Eye, and Respiratory Irritations', 'Human Toxicity Excerpts',
+  'Non-Human Toxicity Excerpts',
+  // NEW: these sections contain rich tox data
+  'GHS Classification', 'Hazard Classes and Categories',
+  'Mechanism of Action', 'Evidence for Carcinogenicity',
+  'Signs and Symptoms', 'Adverse Effects', 'Toxicity Summary',
+  'Effects of Long Term Exposure', 'TSCA Test Submissions',
 ]);
 
 function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
@@ -374,7 +399,8 @@ function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
       if (
         heading === 'EPA IRIS Information' ||
         heading === 'EPA Provisional Peer-Reviewed Toxicity Values' ||
-        heading === 'RAIS Toxicity Values'
+        heading === 'RAIS Toxicity Values' ||
+        heading === 'Threshold Limit Values (TLV)'
       ) {
         items.push(...extractTableLikeSection(c));
       } else {
@@ -1033,11 +1059,13 @@ export async function generateToxProfile(cas) {
 
   console.log(`[ToxProfile] CAS ${normalizedCas} → CID ${cid}. Fetching data…`);
 
-  const [props, toxData, ghsData, fullData] = await Promise.all([
+  // Fetch PubChem data (PUG-View) and HSDB complete data (Annotations API) in parallel
+  const [props, toxData, ghsData, fullData, hsdbComplete] = await Promise.all([
     getPubchemProps(cid),
     fetchPugView(cid, 'Toxicity'),
     fetchPugView(cid, 'GHS Classification'),
     fetchFullPugView(cid),
+    fetchHsdbComplete(cid),
   ]);
 
   const substanceName = props.IUPACName || normalizedCas;
@@ -1045,22 +1073,15 @@ export async function generateToxProfile(cas) {
   const ghsRoot = ghsData?.Record || null;
   const fullRoot = fullData?.Record || null;
 
+  // Build PubChem text from PUG-View (GHS, Mechanism of Action, etc.)
   const pubchemText = buildPubchemText(toxRoot, ghsRoot, fullRoot);
-  const { hsdb1, hsdb2, hsdb3, hsdb4, foundHeadings } = buildHsdbGroups(fullRoot);
+  
+  // Use HSDB complete data (from Annotations API, not truncated)
+  const { hsdb1, hsdb2, hsdb3, hsdb4, stats: hsdbStats } = hsdbComplete;
 
   console.log(`[ToxProfile] PubChem text: ${pubchemText.length} chars`);
-  console.log(`[ToxProfile] HSDB groups: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
-  console.log(`[ToxProfile] HSDB headings found: ${foundHeadings.join(', ') || '(none)'}`);
-
-  // Enrich prompt 4 with EPA IRIS / RAIS data from full PUG-View
-  const epaIrisSection = findSection(fullRoot, 'EPA IRIS Information');
-  const epaPPRTVSection = findSection(fullRoot, 'EPA Provisional Peer-Reviewed Toxicity Values');
-  const raisSection = findSection(fullRoot, 'RAIS Toxicity Values');
-  const vtrSupplement = serializeSections({
-    'EPA IRIS Information': epaIrisSection ? extractTableLikeSection(epaIrisSection) : [],
-    'EPA Provisional Peer-Reviewed Toxicity Values': epaPPRTVSection ? extractTableLikeSection(epaPPRTVSection) : [],
-    'RAIS Toxicity Values': raisSection ? extractTableLikeSection(raisSection) : [],
-  });
+  console.log(`[ToxProfile] HSDB complete: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
+  console.log(`[ToxProfile] HSDB stats: ${JSON.stringify(hsdbStats)}`);
 
   console.log('[ToxProfile] Sending 4 parallel prompts to OpenRouter…');
 
@@ -1068,9 +1089,7 @@ export async function generateToxProfile(cas) {
     callOpenRouter(buildPrompt1(substanceName, normalizedCas, pubchemText, hsdb1)),
     callOpenRouter(buildPrompt2(substanceName, normalizedCas, pubchemText, hsdb2)),
     callOpenRouter(buildPrompt3(substanceName, normalizedCas, pubchemText, hsdb3)),
-    callOpenRouter(buildPrompt4(substanceName, normalizedCas, pubchemText,
-      hsdb4 + (vtrSupplement ? '\n\n' + vtrSupplement : '')
-    )),
+    callOpenRouter(buildPrompt4(substanceName, normalizedCas, pubchemText, hsdb4)),
   ]);
 
   const sectionOrder = [
