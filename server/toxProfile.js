@@ -6,8 +6,8 @@
 import { fetchHsdbComplete } from './hsdbFetch.js';
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || '';
-const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || '')
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-super-120b-a12b:free';
+const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || 'arcee-ai/trinity-large-preview:free,stepfun/step-3.5-flash:free')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
@@ -329,64 +329,32 @@ function serializeSections(sections) {
 // ─── Build PubChem Toxicity text ──────────────────────────────────────────────
 
 const PUBCHEM_TOX_HEADINGS = [
-  // Core tox sections
-  'Acute Effects',
-  'Non-Human Toxicity Values',
-  'Exposure Routes',
-  'Symptoms',
-  'Human Toxicity Excerpts',
-  'Non-Human Toxicity Excerpts',
-  'Health Effects',
-  'First Aid',
+  // Only sections NOT covered by HSDB complete data
   'Hazards Summary',
-  'Skin, Eye, and Respiratory Irritations',
-  'Carcinogenicity',
-  'Genotoxicity',
-  'Reproductive Effects',
-  // VTR sections
+  'GHS Classification',
+  'Hazard Classes and Categories',
+  'Carcinogen Classification',
+  'Adverse Effects',
+  'Target Organs',
+  'Non-Human Toxicity Values',
+  // VTR (critical, not in HSDB)
   'EPA IRIS Information',
   'EPA Provisional Peer-Reviewed Toxicity Values',
   'RAIS Toxicity Values',
-  // NEW: sections where genotox/reprotox/sensitization data ACTUALLY lives
-  // (PubChem truncates HSDB excerpts to 5 items, so these sections are crucial)
-  'GHS Classification',
-  'Hazard Classes and Categories',
-  'Mechanism of Action',
-  'Evidence for Carcinogenicity',
-  'Carcinogen Classification',
-  'Signs and Symptoms',
-  'Target Organs',
-  'Cancer Sites',
-  'Adverse Effects',
-  'Toxicity Summary',
-  'Effects of Short Term Exposure',
-  'Effects of Long Term Exposure',
-  'Populations at Special Risk',
-  'TSCA Test Submissions',
-  'Reported Fatal Dose',
   'Threshold Limit Values (TLV)',
-  'Medical Surveillance',
   'NIOSH Recommendations',
 ];
 
-// Headings where we want more data extracted (complex tox sections)
 const ENHANCED_HEADINGS = new Set([
-  'Genotoxicity', 'Reproductive Effects', 'Carcinogenicity',
-  'Skin, Eye, and Respiratory Irritations', 'Human Toxicity Excerpts',
-  'Non-Human Toxicity Excerpts',
-  // NEW: these sections contain rich tox data
   'GHS Classification', 'Hazard Classes and Categories',
-  'Mechanism of Action', 'Evidence for Carcinogenicity',
-  'Signs and Symptoms', 'Adverse Effects', 'Toxicity Summary',
-  'Effects of Long Term Exposure', 'TSCA Test Submissions',
 ]);
 
 function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
   const sections = {};
   for (const heading of PUBCHEM_TOX_HEADINGS) {
     const items = [];
-    const maxItems = ENHANCED_HEADINGS.has(heading) ? 12 : 6;
-    const maxChars = ENHANCED_HEADINGS.has(heading) ? 1400 : 1000;
+    const maxItems = ENHANCED_HEADINGS.has(heading) ? 8 : 4;
+    const maxChars = 600;
 
     const a = findSection(toxRoot, heading);
     const b = findSection(ghsRoot, heading);
@@ -412,11 +380,7 @@ function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
   }
 
   const foundHeadings = Object.keys(sections);
-  const missingHeadings = PUBCHEM_TOX_HEADINGS.filter(h => !sections[h]);
   console.log(`[ToxProfile] PubChem headings with data: ${foundHeadings.join(', ')}`);
-  if (missingHeadings.length) {
-    console.log(`[ToxProfile] PubChem headings WITHOUT data: ${missingHeadings.join(', ')}`);
-  }
 
   return serializeSections(sections);
 }
@@ -1083,13 +1047,33 @@ export async function generateToxProfile(cas) {
   console.log(`[ToxProfile] HSDB complete: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
   console.log(`[ToxProfile] HSDB stats: ${JSON.stringify(hsdbStats)}`);
 
+  // Safety: truncate data if combined size is too large for LLM context
+  // Target: ~20K chars max per prompt (~6K tokens) to leave room for output
+  const MAX_DATA_CHARS = 20000;
+  function truncateData(pub, hsdb) {
+    const total = pub.length + hsdb.length;
+    if (total <= MAX_DATA_CHARS) return { pub, hsdb };
+    // Prioritize HSDB (more specific), truncate pubchem first
+    const pubBudget = Math.max(3000, MAX_DATA_CHARS - hsdb.length);
+    const truncPub = pub.length > pubBudget ? pub.substring(0, pubBudget) + '\n[… tronqué]' : pub;
+    const hsdbBudget = MAX_DATA_CHARS - truncPub.length;
+    const truncHsdb = hsdb.length > hsdbBudget ? hsdb.substring(0, hsdbBudget) + '\n[… tronqué]' : hsdb;
+    return { pub: truncPub, hsdb: truncHsdb };
+  }
+
+  const d1 = truncateData(pubchemText, hsdb1);
+  const d2 = truncateData(pubchemText, hsdb2);
+  const d3 = truncateData(pubchemText, hsdb3);
+  const d4 = truncateData(pubchemText, hsdb4);
+
+  console.log(`[ToxProfile] Prompt sizes (pub+hsdb): P1=${d1.pub.length+d1.hsdb.length}, P2=${d2.pub.length+d2.hsdb.length}, P3=${d3.pub.length+d3.hsdb.length}, P4=${d4.pub.length+d4.hsdb.length}`);
   console.log('[ToxProfile] Sending 4 parallel prompts to OpenRouter…');
 
   const [result1, result2, result3, result4] = await Promise.all([
-    callOpenRouter(buildPrompt1(substanceName, normalizedCas, pubchemText, hsdb1)),
-    callOpenRouter(buildPrompt2(substanceName, normalizedCas, pubchemText, hsdb2)),
-    callOpenRouter(buildPrompt3(substanceName, normalizedCas, pubchemText, hsdb3)),
-    callOpenRouter(buildPrompt4(substanceName, normalizedCas, pubchemText, hsdb4)),
+    callOpenRouter(buildPrompt1(substanceName, normalizedCas, d1.pub, d1.hsdb)),
+    callOpenRouter(buildPrompt2(substanceName, normalizedCas, d2.pub, d2.hsdb)),
+    callOpenRouter(buildPrompt3(substanceName, normalizedCas, d3.pub, d3.hsdb)),
+    callOpenRouter(buildPrompt4(substanceName, normalizedCas, d4.pub, d4.hsdb)),
   ]);
 
   const sectionOrder = [
