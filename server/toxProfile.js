@@ -1,11 +1,11 @@
 // server/toxProfile.js
 // Profil toxicologique via PubChem + full PUG-View + OpenRouter
-// Version enrichie : extraction ciblée des paragraphes HSDB par préfixes utiles
+// v8 — Extraction HSDB améliorée + choix modèles gratuits optimisé
 // Signature conservée : generateToxProfile(cas)
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || '';
-const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || '')
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'nvidia/nemotron-3-super:free';
+const OPENROUTER_FALLBACK_MODELS = (process.env.OPENROUTER_FALLBACK_MODELS || 'arcee-ai/trinity-large-preview:free,stepfun/step-3.5-flash:free')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
@@ -28,6 +28,8 @@ function getCached(cas) {
 function setCache(cas, profile) {
   profileCache.set(cas, { profile, timestamp: Date.now() });
 }
+
+// ─── PubChem API helpers ──────────────────────────────────────────────────────
 
 async function pubchemGet(url) {
   try {
@@ -72,6 +74,8 @@ async function fetchFullPugView(cid) {
   );
 }
 
+// ─── Tree traversal helpers ───────────────────────────────────────────────────
+
 function findSection(node, heading) {
   if (!node) return null;
   if (node.TOCHeading === heading) return node;
@@ -84,11 +88,11 @@ function findSection(node, heading) {
   return null;
 }
 
-function findSections(node, heading, out = []) {
+function findAllSections(node, heading, out = []) {
   if (!node) return out;
   if (node.TOCHeading === heading) out.push(node);
   if (node.Section) {
-    for (const s of node.Section) findSections(s, heading, out);
+    for (const s of node.Section) findAllSections(s, heading, out);
   }
   return out;
 }
@@ -103,24 +107,56 @@ function formatRef(raw) {
   return year ? `${author}, ${year}` : author.substring(0, 50);
 }
 
-function sectionLooksHsdb(section) {
-  const s = JSON.stringify(section || {});
-  return s.includes('/source/hsdb/') || s.includes('/source/11933') || s.includes('HSDB record page');
+// ─── HSDB detection ───────────────────────────────────────────────────────────
+// HSDB data in PubChem PUG-View is identified by:
+// 1. Reference entries containing "/source/hsdb/" URL
+// 2. Reference entries with SourceName "Hazardous Substances Data Bank (HSDB)"
+// 3. Reference entries with source IDs containing "11933" (HSDB's PubChem source ID)
+// We check at the Information level (each data item), not the section level,
+// because sections often mix HSDB + non-HSDB data.
+
+function isHsdbReference(refNumber, references) {
+  if (!references || !refNumber) return false;
+  const ref = references.find(r => r.ReferenceNumber === refNumber);
+  if (!ref) return false;
+  const url = ref.URL || '';
+  const source = ref.SourceName || '';
+  return url.includes('/source/hsdb/') || 
+         source.includes('Hazardous Substances Data Bank') ||
+         source.includes('HSDB');
 }
 
-function extractItems(node, maxItems = 6, maxChars = 1000) {
+function sectionHasHsdbData(section, references) {
+  if (!section) return false;
+  // Quick check: stringify a small sample
+  const sample = JSON.stringify(section).substring(0, 10000);
+  return sample.includes('/source/hsdb/') || 
+         sample.includes('source/11933') || 
+         sample.includes('HSDB record page') ||
+         sample.includes('Hazardous Substances Data Bank');
+}
+
+// ─── Data extraction ──────────────────────────────────────────────────────────
+
+/**
+ * Extract text items from a PUG-View section node.
+ * Each item = { text, ref, name }
+ * - name is the Information.Name field (e.g. "LD50", "LC50", etc.)
+ */
+function extractItems(node, maxItems = 8, maxChars = 1200) {
   const items = [];
   function walk(n) {
     if (!n || items.length >= maxItems) return;
     if (n.Information) {
       for (const inf of n.Information) {
         if (items.length >= maxItems) break;
+        const name = inf.Name ? String(inf.Name).trim() : '';
         const strings = inf.Value?.StringWithMarkup?.map(s => s.String).filter(s => s && s.length > 10) || [];
         const ref = formatRef(inf.Reference?.[0] || '');
         for (const str of strings.slice(0, 2)) {
           if (items.length >= maxItems) break;
           const text = str.length > maxChars ? str.substring(0, maxChars) + '…' : str;
-          items.push({ text: text.trim(), ref });
+          items.push({ text: text.trim(), ref, name });
         }
       }
     }
@@ -130,13 +166,54 @@ function extractItems(node, maxItems = 6, maxChars = 1000) {
   return items;
 }
 
+/**
+ * Extract items from a section where the Information.Name field matches given keywords.
+ * This is more reliable than prefix-matching on text content because HSDB data
+ * in PubChem uses structured Name fields.
+ */
+function extractByInfoName(node, nameKeywords, maxItems = 10, maxChars = 1400) {
+  const items = [];
+  const normKeywords = nameKeywords.map(k => k.toLowerCase());
+
+  function walk(n) {
+    if (!n || items.length >= maxItems) return;
+    if (n.Information) {
+      for (const inf of n.Information) {
+        if (items.length >= maxItems) break;
+        const name = String(inf.Name || '').toLowerCase();
+        if (!name) continue;
+        if (!normKeywords.some(k => name.includes(k))) continue;
+        const strings = inf.Value?.StringWithMarkup?.map(s => s.String).filter(s => s && s.length > 10) || [];
+        const ref = formatRef(inf.Reference?.[0] || '');
+        for (const str of strings) {
+          if (items.length >= maxItems) break;
+          const text = str.length > maxChars ? str.substring(0, maxChars) + '…' : str;
+          items.push({ text: text.trim(), ref, name: inf.Name || '' });
+        }
+      }
+    }
+    if (n.Section) n.Section.forEach(walk);
+  }
+  walk(node);
+  return items;
+}
+
+/**
+ * Extract items where text content matches prefixes (tag-like markers).
+ * HSDB text paragraphs in "Human Health Effects" and "Non-Human Toxicity Excerpts"
+ * sections often start with prefix tags like:
+ *   /SIGNS AND SYMPTOMS/
+ *   /LABORATORY ANIMALS: Acute exposure/
+ *   /GENOTOXICITY/
+ *   /IMMUNOTOXICITY/
+ * etc.
+ */
 function extractPrefixedItems(node, prefixes, maxItems = 10, maxChars = 1400) {
   const items = [];
   const normPrefixes = prefixes.map(p => p.toLowerCase());
 
   function walk(n) {
     if (!n || items.length >= maxItems) return;
-
     if (n.Information) {
       for (const inf of n.Information) {
         if (items.length >= maxItems) break;
@@ -151,22 +228,21 @@ function extractPrefixedItems(node, prefixes, maxItems = 10, maxChars = 1400) {
         }
       }
     }
-
     if (n.Section) n.Section.forEach(walk);
   }
-
   walk(node);
   return items;
 }
 
-// Like extractPrefixedItems but matches keywords ANYWHERE in text (not just prefix)
+/**
+ * Extract items where text content contains any of the given keywords anywhere.
+ */
 function extractKeywordItems(node, keywords, maxItems = 10, maxChars = 1400) {
   const items = [];
   const normKeywords = keywords.map(k => k.toLowerCase());
 
   function walk(n) {
     if (!n || items.length >= maxItems) return;
-
     if (n.Information) {
       for (const inf of n.Information) {
         if (items.length >= maxItems) break;
@@ -181,25 +257,26 @@ function extractKeywordItems(node, keywords, maxItems = 10, maxChars = 1400) {
         }
       }
     }
-
     if (n.Section) n.Section.forEach(walk);
   }
-
   walk(node);
   return items;
 }
 
-// Find ALL sections (anywhere in tree) whose TOCHeading matches keywords, optionally HSDB-only
+/**
+ * Find ALL sections anywhere in the tree whose TOCHeading matches any keyword.
+ * Optionally filter to HSDB-sourced sections only.
+ */
 function findSectionsByKeywords(root, keywords, hsdbOnly = false) {
   const results = [];
   const normKeywords = keywords.map(k => k.toLowerCase());
-  
+
   function walk(node) {
     if (!node) return;
     if (node.TOCHeading) {
       const lower = node.TOCHeading.toLowerCase();
       if (normKeywords.some(k => lower.includes(k))) {
-        if (!hsdbOnly || sectionLooksHsdb(node)) {
+        if (!hsdbOnly || sectionHasHsdbData(node)) {
           results.push(node);
         }
       }
@@ -210,6 +287,10 @@ function findSectionsByKeywords(root, keywords, hsdbOnly = false) {
   return results;
 }
 
+/**
+ * Extract table-like data from sections that use Name/Value pairs in Information.
+ * Good for sections like EPA IRIS, RAIS Toxicity Values, Occupational Exposure Standards.
+ */
 function extractTableLikeSection(node, maxRows = 25) {
   const rows = [];
   if (!node?.Information) return rows;
@@ -237,6 +318,8 @@ function serializeSections(sections) {
   }).join('\n\n');
 }
 
+// ─── Build PubChem Toxicity text ──────────────────────────────────────────────
+
 const PUBCHEM_TOX_HEADINGS = [
   'Acute Effects',
   'Non-Human Toxicity Values',
@@ -245,7 +328,6 @@ const PUBCHEM_TOX_HEADINGS = [
   'Human Toxicity Excerpts',
   'Health Effects',
   'First Aid',
-  'Medical Treatment',
   'Inhalation First Aid',
   'Skin First Aid',
   'Eye First Aid',
@@ -253,20 +335,19 @@ const PUBCHEM_TOX_HEADINGS = [
   'Top Hazards',
   'Classes and Categories',
   'Hazards Summary',
-  'NFPA Hazard Classification',
   'Skin, Eye, and Respiratory Irritations',
   'Carcinogenicity',
   'Genotoxicity',
   'Reproductive Effects',
   'EPA IRIS Information',
   'EPA Provisional Peer-Reviewed Toxicity Values',
-  'RAIS Toxicity Values'
+  'RAIS Toxicity Values',
 ];
 
 // Headings where we want more data extracted (complex tox sections)
 const ENHANCED_HEADINGS = new Set([
   'Genotoxicity', 'Reproductive Effects', 'Carcinogenicity',
-  'Skin, Eye, and Respiratory Irritations'
+  'Skin, Eye, and Respiratory Irritations', 'Human Toxicity Excerpts',
 ]);
 
 function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
@@ -281,7 +362,7 @@ function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
     const c = findSection(fullRoot, heading);
 
     if (a) items.push(...extractItems(a, maxItems, maxChars));
-    if (b) items.push(...extractItems(b, maxItems - items.length, maxChars));
+    if (b && items.length < maxItems) items.push(...extractItems(b, maxItems - items.length, maxChars));
 
     if (c && items.length < maxItems) {
       if (
@@ -297,58 +378,128 @@ function buildPubchemText(toxRoot, ghsRoot, fullRoot) {
 
     if (items.length) sections[heading] = items;
   }
-  
-  // Debug: log which headings produced data
+
   const foundHeadings = Object.keys(sections);
   const missingHeadings = PUBCHEM_TOX_HEADINGS.filter(h => !sections[h]);
   console.log(`[ToxProfile] PubChem headings with data: ${foundHeadings.join(', ')}`);
   if (missingHeadings.length) {
     console.log(`[ToxProfile] PubChem headings WITHOUT data: ${missingHeadings.join(', ')}`);
   }
-  
+
   return serializeSections(sections);
 }
 
-function collectHsdbHeadings(fullRoot) {
-  const wanted = new Set([
-    'Human Toxicity Excerpts',
-    'Human Toxicity Excerpts (Complete)',
-    'Non-Human Toxicity Excerpts',
-    'Non-Human Toxicity Excerpts (Complete)',
-    'Non-Human Toxicity Values',
-    'Non-Human Toxicity Values (Complete)',
-    'Absorption, Distribution and Excretion',
-    'Absorption, Distribution and Excretion (Complete)',
-    'Metabolism/Metabolites',
-    'Metabolism/Metabolites (Complete)',
-    'Pharmacology',
-    'Pharmacology (Complete)',
-    'Medical Surveillance',
-    'Medical Surveillance (Complete)',
-    'Reported Fatal Dose',
-    'Reported Fatal Dose (Complete)',
-    'Evidence for Carcinogenicity',
-    'Evidence for Carcinogenicity (Complete)',
-    'Occupational Exposure Standards',
-    'Occupational Exposure Standards (Complete)',
-    'NIOSH Recommendations',
-    'NIOSH Recommendations (Complete)',
-    'Preventive Measures',
-    'Preventive Measures (Complete)',
-    'Animal Toxicity Studies',
-    'Genotoxicity',
-    'Genotoxicity (Complete)',
-    'Reproductive Effects',
-    'Reproductive Effects (Complete)',
-    'Developmental Toxicity/Teratogenicity',
-    'Developmental Toxicity/Teratogenicity (Complete)',
-  ]);
+// ─── Improved HSDB extraction ─────────────────────────────────────────────────
+// 
+// Key insight: HSDB data in PubChem PUG-View lives under specific TOCHeadings
+// in the full compound record. The main HSDB-contributed sections are:
+//
+// Under "Toxicological Information" (or "Toxicity"):
+//   - "Human Health Effects" → contains sub-paragraphs tagged with prefixes
+//     like /SIGNS AND SYMPTOMS/, /GENOTOXICITY/, /IMMUNOTOXICITY/ etc.
+//     These are in the Information[].Value.StringWithMarkup[].String
+//   - "Non-Human Toxicity Excerpts" (and Complete variant)
+//     Same prefix-tag structure: /LABORATORY ANIMALS: Acute exposure/ etc.
+//   - "Non-Human Toxicity Values" (and Complete) — LD50/LC50 values
+//   - "Absorption, Distribution and Excretion" (and Complete)
+//   - "Metabolism/Metabolites" (and Complete) 
+//   - "Evidence for Carcinogenicity" (and Complete)
+//   - "Reported Fatal Dose" (and Complete)
+//   - "Animal Toxicity Studies" — broad section with sub-sections
+//
+// Under "Safety and Hazards":
+//   - "Occupational Exposure Standards" (and Complete)
+//   - "NIOSH Recommendations" (and Complete)
+//   - "Medical Surveillance" (and Complete)
+//   - "Preventive Measures" (and Complete)
+//
+// The HSDB "Human Health Effects" section text items often use prefix tags:
+//   /SIGNS AND SYMPTOMS/ — acute symptoms
+//   /ACUTE HAZARDS/ — acute hazard summary
+//   /LABORATORY ANIMALS: Acute exposure/ — acute animal data
+//   /LABORATORY ANIMALS: Subchronic or prechronic exposure/ — repeated dose
+//   /LABORATORY ANIMALS: Chronic exposure or carcinogenicity/ — chronic
+//   /LABORATORY ANIMALS: Developmental or reproductive toxicity/ — reprotox
+//   /GENOTOXICITY/ — genotoxicity data
+//   /MUTAGENICITY/ — mutagenicity data
+//   /ALTERNATIVE and IN VITRO TESTS/ — in vitro genotox
+//   /IMMUNOTOXICITY/ — immune effects
+//   /SKIN, EYE AND RESPIRATORY IRRITATION/ — irritation data
+//   /SENSITIZATION/ — sensitization data
+//
+// IMPORTANT: Some substances don't have these as separate TOCHeading sections.
+// Instead, the data is embedded as tagged paragraphs within "Human Health Effects"
+// or "Non-Human Toxicity Excerpts (Complete)". Our extraction must handle both:
+//   1. Direct TOCHeading match (e.g., a section literally called "Genotoxicity")
+//   2. Prefix-tagged paragraphs within parent sections
+//   3. Keyword matching in text when neither of the above works
+//   4. Global tree search as last resort
 
-  const found = {};
+// All HSDB headings we want to look for in the full PUG-View record
+const HSDB_WANTED_HEADINGS = [
+  // ADME
+  'Absorption, Distribution and Excretion',
+  'Absorption, Distribution and Excretion (Complete)',
+  'Metabolism/Metabolites',
+  'Metabolism/Metabolites (Complete)',
+  'Pharmacology',
+  'Pharmacology (Complete)',
+  // Acute / general tox
+  'Human Toxicity Excerpts',
+  'Human Toxicity Excerpts (Complete)',
+  'Human Health Effects',
+  'Non-Human Toxicity Excerpts',
+  'Non-Human Toxicity Excerpts (Complete)',
+  'Non-Human Toxicity Values',
+  'Non-Human Toxicity Values (Complete)',
+  'Animal Toxicity Studies',
+  'Reported Fatal Dose',
+  'Reported Fatal Dose (Complete)',
+  // Carcinogenicity
+  'Evidence for Carcinogenicity',
+  'Evidence for Carcinogenicity (Complete)',
+  // Reprotox
+  'Reproductive Effects',
+  'Reproductive Effects (Complete)',
+  'Developmental Toxicity/Teratogenicity',
+  'Developmental Toxicity/Teratogenicity (Complete)',
+  // Genotox (may exist as a direct heading in some records)
+  'Genotoxicity',
+  'Genotoxicity (Complete)',
+  // Occupational / standards
+  'Occupational Exposure Standards',
+  'Occupational Exposure Standards (Complete)',
+  'NIOSH Recommendations',
+  'NIOSH Recommendations (Complete)',
+  'Medical Surveillance',
+  'Medical Surveillance (Complete)',
+  'Preventive Measures',
+  'Preventive Measures (Complete)',
+];
+
+/**
+ * Collect all HSDB-sourced sections from the full PUG-View record.
+ * Returns a Map of heading → section node.
+ * We look for HSDB data at ANY level: some records have it under "Toxicological Information",
+ * others under "Safety and Hazards", etc.
+ */
+function collectHsdbSections(fullRoot) {
+  const wanted = new Set(HSDB_WANTED_HEADINGS);
+  const found = new Map();
+
   function walk(node) {
     if (!node) return;
-    if (node.TOCHeading && wanted.has(node.TOCHeading) && sectionLooksHsdb(node)) {
-      found[node.TOCHeading] = node;
+    if (node.TOCHeading && wanted.has(node.TOCHeading)) {
+      // Accept the section even without strict HSDB check — PubChem sometimes
+      // doesn't embed HSDB URLs at the section level. We'll filter at data level if needed.
+      // But prefer HSDB-sourced ones if found.
+      const existing = found.get(node.TOCHeading);
+      if (!existing) {
+        found.set(node.TOCHeading, node);
+      } else if (sectionHasHsdbData(node) && !sectionHasHsdbData(existing)) {
+        // Replace with the HSDB-sourced version
+        found.set(node.TOCHeading, node);
+      }
     }
     if (node.Section) node.Section.forEach(walk);
   }
@@ -364,8 +515,77 @@ function mergeSections(...entries) {
   return serializeSections(out);
 }
 
+/**
+ * Multi-strategy topic extractor.
+ * Tries in order:
+ *   1. Prefix-matched text in parent nodes (HSDB tagged paragraphs)
+ *   2. Sub-section heading match within parent nodes
+ *   3. Keyword-anywhere-in-text match in parent nodes
+ *   4. Information.Name field match in parent nodes
+ *   5. Global tree search for sections matching keywords
+ * Returns the first non-empty result.
+ */
+function extractTopic(fullRoot, parentNodes, {
+  prefixes = [],
+  subHeadingKeywords = [],
+  textKeywords = [],
+  infoNameKeywords = [],
+  treeKeywords = null,
+  maxItems = 10,
+  maxChars = 1400,
+} = {}) {
+  // Strategy 1: prefix tags in text content
+  if (prefixes.length) {
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractPrefixedItems(node, prefixes, maxItems, maxChars);
+      if (items.length) return items;
+    }
+  }
+
+  // Strategy 2: sub-section headings
+  if (subHeadingKeywords.length) {
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractSubSectionItems(node, subHeadingKeywords, maxItems, maxChars);
+      if (items.length) return items;
+    }
+  }
+
+  // Strategy 3: keyword in text content
+  if (textKeywords.length) {
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractKeywordItems(node, textKeywords, maxItems, maxChars);
+      if (items.length) return items;
+    }
+  }
+
+  // Strategy 4: Information.Name field match
+  if (infoNameKeywords.length) {
+    for (const node of parentNodes) {
+      if (!node) continue;
+      const items = extractByInfoName(node, infoNameKeywords, maxItems, maxChars);
+      if (items.length) return items;
+    }
+  }
+
+  // Strategy 5: global tree search
+  if (treeKeywords && fullRoot) {
+    const sections = findSectionsByKeywords(fullRoot, treeKeywords, false);
+    for (const sec of sections) {
+      const items = extractItems(sec, maxItems, maxChars);
+      if (items.length) return items;
+    }
+  }
+
+  return [];
+}
+
+/**
+ * Navigate into sub-sections by TOCHeading keywords.
+ */
 function extractSubSectionItems(parentNode, subHeadings, maxItems = 10, maxChars = 1400) {
-  // Navigate into sub-sections by TOCHeading (instead of prefix-matching text content)
   const items = [];
   if (!parentNode) return items;
   const normalizedHeadings = subHeadings.map(h => h.toLowerCase());
@@ -376,7 +596,7 @@ function extractSubSectionItems(parentNode, subHeadings, maxItems = 10, maxChars
       const lower = n.TOCHeading.toLowerCase();
       if (normalizedHeadings.some(h => lower.includes(h))) {
         items.push(...extractItems(n, maxItems - items.length, maxChars));
-        return; // Don't recurse deeper once we matched
+        return;
       }
     }
     if (n.Section) n.Section.forEach(walk);
@@ -385,148 +605,176 @@ function extractSubSectionItems(parentNode, subHeadings, maxItems = 10, maxChars
   return items;
 }
 
-function buildHsdbGroupsFromFullRecord(fullRoot) {
-  const found = collectHsdbHeadings(fullRoot);
+// ─── Build HSDB data groups for the 4 prompts ────────────────────────────────
 
-  const get = (name) => found[name] || null;
+function buildHsdbGroups(fullRoot) {
+  const hsdb = collectHsdbSections(fullRoot);
+
+  const get = (name) => hsdb.get(name) || null;
   const getItems = (name, maxItems = 8, maxChars = 1200) => {
     const node = get(name);
     if (!node) return [];
     return extractItems(node, maxItems, maxChars);
   };
 
-  const humanComplete = get('Human Toxicity Excerpts (Complete)');
-  const nonHumanComplete = get('Non-Human Toxicity Excerpts (Complete)');
+  // Main data-rich sections
+  const humanExcerpts = get('Human Toxicity Excerpts (Complete)') || get('Human Toxicity Excerpts');
+  const humanHealth = get('Human Health Effects');
+  const nonHumanExcerpts = get('Non-Human Toxicity Excerpts (Complete)') || get('Non-Human Toxicity Excerpts');
   const animalStudies = get('Animal Toxicity Studies');
 
-  // --- Helper: multi-strategy extraction for a topic ---
-  // Strategy 1: prefix match on text (original approach)
-  // Strategy 2: sub-section heading match  
-  // Strategy 3: keyword-anywhere-in-text match
-  // Strategy 4: find ANY section in full tree with matching heading
-  // Returns first non-empty result
-  function extractTopic(parentNodes, prefixes, subHeadingKeywords, textKeywords, treeKeywords) {
-    // Strategy 1: prefix
-    for (const node of parentNodes) {
-      if (!node) continue;
-      const items = extractPrefixedItems(node, prefixes, 10, 1400);
-      if (items.length) return items;
-    }
-    // Strategy 2: sub-section headings
-    for (const node of parentNodes) {
-      if (!node) continue;
-      const items = extractSubSectionItems(node, subHeadingKeywords, 10, 1400);
-      if (items.length) return items;
-    }
-    // Strategy 3: keyword in text content
-    for (const node of parentNodes) {
-      if (!node) continue;
-      const items = extractKeywordItems(node, textKeywords, 8, 1400);
-      if (items.length) return items;
-    }
-    // Strategy 4: find sections anywhere in full PUG-View tree
-    if (treeKeywords && fullRoot) {
-      const sections = findSectionsByKeywords(fullRoot, treeKeywords, false);
-      for (const sec of sections) {
-        const items = extractItems(sec, 8, 1400);
-        if (items.length) return items;
-      }
-    }
-    return [];
-  }
+  // Parent nodes pool for multi-strategy extraction
+  const allHumanSources = [humanExcerpts, humanHealth].filter(Boolean);
+  const allAnimalSources = [animalStudies, nonHumanExcerpts].filter(Boolean);
+  const allSources = [...allHumanSources, ...allAnimalSources];
 
+  // ── Group 1: Toxicokinetics (ADME) + Acute Toxicity ──
   const hsdb1 = mergeSections(
     ['Absorption, Distribution and Excretion', getItems('Absorption, Distribution and Excretion')],
     ['Absorption, Distribution and Excretion (Complete)', getItems('Absorption, Distribution and Excretion (Complete)')],
     ['Metabolism/Metabolites', getItems('Metabolism/Metabolites')],
     ['Metabolism/Metabolites (Complete)', getItems('Metabolism/Metabolites (Complete)')],
-    ['Human Toxicity Excerpts (Complete)', humanComplete ? extractPrefixedItems(humanComplete, [
-      '/acute hazard',
-      '/acute toxicity',
-      '/signs and symptoms'
-    ]) : []],
-    ['Non-Human Toxicity Excerpts (Complete)', nonHumanComplete ? extractPrefixedItems(nonHumanComplete, [
-      '/laboratory animals: acute exposure',
-      '/acute toxicity'
-    ]) : []],
+    ['Pharmacology', getItems('Pharmacology')],
+    ['Pharmacology (Complete)', getItems('Pharmacology (Complete)')],
+    // Acute toxicity from human excerpts
+    ['Acute toxicity (human)', extractTopic(fullRoot, allHumanSources, {
+      prefixes: [
+        '/acute hazard', '/acute toxicity', '/signs and symptoms',
+        '/poisoning', '/acute exposure',
+      ],
+      textKeywords: ['acute exposure', 'acute toxicity', 'signs and symptoms', 'lethal dose', 'fatal'],
+      infoNameKeywords: ['acute', 'signs', 'symptoms', 'fatal', 'poisoning'],
+    })],
+    // Acute toxicity from animal excerpts
+    ['Acute toxicity (animal)', extractTopic(fullRoot, allAnimalSources, {
+      prefixes: [
+        '/laboratory animals: acute exposure',
+        '/acute toxicity',
+      ],
+      subHeadingKeywords: ['acute exposure', 'acute toxicity'],
+      textKeywords: ['ld50', 'lc50', 'acute oral', 'acute inhal', 'acute dermal'],
+      infoNameKeywords: ['ld50', 'lc50', 'acute'],
+    })],
     ['Non-Human Toxicity Values', getItems('Non-Human Toxicity Values')],
-    ['Non-Human Toxicity Values (Complete)', getItems('Non-Human Toxicity Values (Complete)')]
+    ['Non-Human Toxicity Values (Complete)', getItems('Non-Human Toxicity Values (Complete)')],
+    ['Reported Fatal Dose', getItems('Reported Fatal Dose')],
+    ['Reported Fatal Dose (Complete)', getItems('Reported Fatal Dose (Complete)')],
   );
 
-  // --- hsdb2: Irritation / Sensitization / Repeated dose ---
-  const irritSensItems = extractTopic(
-    [humanComplete],
-    ['/irritation', '/skin irritation', '/eye irritation', '/sensitization', '/allergic reactions', '/asthma'],
-    ['irritation', 'sensitization', 'allergic', 'skin sensitization', 'respiratory sensitization'],
-    ['sensitization', 'sensitisation', 'allergic contact', 'dermatitis', 'asthma', 'skin irritation'],
-    ['Skin Sensitization', 'Respiratory Sensitization', 'Sensitization']
-  );
-  const repeatedDoseAnimal = extractTopic(
-    [animalStudies, nonHumanComplete],
-    ['/laboratory animals: subchronic or prechronic exposure', '/laboratory animals: chronic exposure or carcinogenicity'],
-    ['subchronic', 'chronic exposure', 'prechronic'],
-    ['subchronic', 'repeated dose', 'chronic exposure', '90-day', '28-day', 'noael', 'loael'],
-    null
-  );
+  // ── Group 2: Irritation / Sensitization / Repeated dose ──
+  const irritSensItems = extractTopic(fullRoot, allSources, {
+    prefixes: [
+      '/skin, eye and respiratory irritation',
+      '/irritation', '/skin irritation', '/eye irritation',
+      '/sensitization', '/allergic reactions', '/allergic contact',
+      '/immunotoxicity',
+    ],
+    subHeadingKeywords: [
+      'irritation', 'sensitization', 'sensitisation', 'allergic',
+      'skin sensitization', 'respiratory sensitization', 'immunotoxicity',
+    ],
+    textKeywords: [
+      'sensitization', 'sensitisation', 'allergic contact', 'dermatitis',
+      'asthma', 'skin irritation', 'eye irritation', 'respiratory irritation',
+      'immunotoxic',
+    ],
+    infoNameKeywords: ['irritation', 'sensitiz', 'allerg', 'immunotox'],
+    treeKeywords: ['Skin Sensitization', 'Respiratory Sensitization', 'Sensitization', 'Irritation'],
+  });
+
+  const repeatedDoseItems = extractTopic(fullRoot, allAnimalSources, {
+    prefixes: [
+      '/laboratory animals: subchronic or prechronic exposure',
+      '/laboratory animals: chronic exposure or carcinogenicity',
+      '/laboratory animals: chronic exposure',
+    ],
+    subHeadingKeywords: ['subchronic', 'chronic exposure', 'prechronic', 'repeated dose'],
+    textKeywords: [
+      'subchronic', 'repeated dose', 'chronic exposure', '90-day', '28-day',
+      'noael', 'loael', 'noel', 'loel', 'subacute',
+    ],
+    infoNameKeywords: ['subchronic', 'chronic', 'repeated', 'noael', 'loael'],
+  });
 
   const hsdb2 = mergeSections(
     ['Irritation / Sensitization data', irritSensItems],
-    ['Animal Studies - repeated dose', repeatedDoseAnimal],
+    ['Animal Studies - repeated dose', repeatedDoseItems],
     ['Medical Surveillance', getItems('Medical Surveillance')],
-    ['Medical Surveillance (Complete)', getItems('Medical Surveillance (Complete)')]
+    ['Medical Surveillance (Complete)', getItems('Medical Surveillance (Complete)')],
+    ['Preventive Measures', getItems('Preventive Measures')],
+    ['Preventive Measures (Complete)', getItems('Preventive Measures (Complete)')],
   );
 
-  // --- hsdb3: Genotoxicity / Carcinogenicity / Reprotox ---
-  const genotoxItems = extractTopic(
-    [humanComplete, nonHumanComplete],
-    ['/genotoxicity'],
-    ['genotoxicity', 'mutagenicity', 'genetic toxicology'],
-    ['genotoxic', 'mutagenic', 'ames test', 'chromosom', 'micronuclei', 'micronucleus', 'sister chromatid', 'dna damage', 'clastogen'],
-    ['Genotoxicity']
-  );
-  const reprotoxItems = extractTopic(
-    [humanComplete, nonHumanComplete, animalStudies],
-    ['/laboratory animals: developmental or reproductive toxicity'],
-    ['reproductive', 'developmental', 'teratogenicity', 'fertility', 'teratogenic'],
-    ['reproductive', 'teratogenic', 'fertility', 'embryo', 'fetal', 'foetal', 'developmental toxicity', 'birth defect', 'malformation'],
-    ['Reproductive Effects', 'Developmental Toxicity']
-  );
+  // ── Group 3: Genotoxicity / Carcinogenicity / Reprotox ──
+  
+  // Genotoxicity: try direct HSDB sections first, then tagged paragraphs
+  const directGenotox = [
+    ...getItems('Genotoxicity'),
+    ...getItems('Genotoxicity (Complete)'),
+  ];
+  const extractedGenotox = directGenotox.length ? [] : extractTopic(fullRoot, allSources, {
+    prefixes: ['/genotoxicity', '/mutagenicity', '/alternative and in vitro tests'],
+    subHeadingKeywords: ['genotoxicity', 'mutagenicity', 'genetic toxicology'],
+    textKeywords: [
+      'genotoxic', 'mutagenic', 'ames test', 'chromosom', 'micronuclei',
+      'micronucleus', 'sister chromatid', 'dna damage', 'clastogen',
+      'umu test', 'comet assay', 'gene mutation',
+    ],
+    infoNameKeywords: ['genotox', 'mutagen', 'ames', 'chromosome', 'micronucleus'],
+    treeKeywords: ['Genotoxicity', 'Mutagenicity'],
+  });
+
+  // Reprotox: try direct sections, then tagged paragraphs
+  const directReprotox = [
+    ...getItems('Reproductive Effects'),
+    ...getItems('Reproductive Effects (Complete)'),
+    ...getItems('Developmental Toxicity/Teratogenicity'),
+    ...getItems('Developmental Toxicity/Teratogenicity (Complete)'),
+  ];
+  const extractedReprotox = directReprotox.length ? [] : extractTopic(fullRoot, allSources, {
+    prefixes: [
+      '/laboratory animals: developmental or reproductive toxicity',
+      '/reproductive',
+    ],
+    subHeadingKeywords: ['reproductive', 'developmental', 'teratogenicity', 'fertility'],
+    textKeywords: [
+      'reproductive', 'teratogenic', 'fertility', 'embryo', 'fetal', 'foetal',
+      'developmental toxicity', 'birth defect', 'malformation', 'spermatogenesis',
+    ],
+    infoNameKeywords: ['reproduct', 'teratogen', 'developmental', 'fertility', 'embryo'],
+    treeKeywords: ['Reproductive Effects', 'Developmental Toxicity'],
+  });
 
   const hsdb3 = mergeSections(
     // Direct HSDB genotoxicity sections
-    ['Genotoxicity', getItems('Genotoxicity')],
-    ['Genotoxicity (Complete)', getItems('Genotoxicity (Complete)')],
-    // Extracted genotox data from excerpts/tree
-    ['Genotoxicity data', genotoxItems],
+    ['Genotoxicity', directGenotox],
+    // Extracted genotoxicity from excerpts/tree
+    ['Genotoxicity data (extracted)', extractedGenotox],
     // Carcinogenicity
     ['Evidence for Carcinogenicity', getItems('Evidence for Carcinogenicity')],
     ['Evidence for Carcinogenicity (Complete)', getItems('Evidence for Carcinogenicity (Complete)')],
     // Direct HSDB reprotox sections
-    ['Reproductive Effects', getItems('Reproductive Effects')],
-    ['Reproductive Effects (Complete)', getItems('Reproductive Effects (Complete)')],
-    ['Developmental Toxicity/Teratogenicity', getItems('Developmental Toxicity/Teratogenicity')],
-    ['Developmental Toxicity/Teratogenicity (Complete)', getItems('Developmental Toxicity/Teratogenicity (Complete)')],
-    // Extracted reprotox data from excerpts/tree
-    ['Reproductive/Developmental data', reprotoxItems]
+    ['Reproductive Effects', directReprotox],
+    // Extracted reprotox from excerpts/tree
+    ['Reproductive/Developmental data (extracted)', extractedReprotox],
   );
 
+  // ── Group 4: Human data / Occupational standards / Reference values ──
   const hsdb4 = mergeSections(
     ['Occupational Exposure Standards', getItems('Occupational Exposure Standards')],
     ['Occupational Exposure Standards (Complete)', getItems('Occupational Exposure Standards (Complete)')],
     ['NIOSH Recommendations', getItems('NIOSH Recommendations')],
     ['NIOSH Recommendations (Complete)', getItems('NIOSH Recommendations (Complete)')],
     ['Reported Fatal Dose', getItems('Reported Fatal Dose')],
-    ['Reported Fatal Dose (Complete)', getItems('Reported Fatal Dose (Complete)')]
+    ['Reported Fatal Dose (Complete)', getItems('Reported Fatal Dose (Complete)')],
   );
 
-  return {
-    hsdb1,
-    hsdb2,
-    hsdb3,
-    hsdb4,
-    foundHeadings: Object.keys(found).sort()
-  };
+  const foundHeadings = [...hsdb.keys()].sort();
+
+  return { hsdb1, hsdb2, hsdb3, hsdb4, foundHeadings };
 }
+
+// ─── OpenRouter LLM call ──────────────────────────────────────────────────────
 
 async function callOpenRouter(prompt) {
   if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY non configurée');
@@ -538,17 +786,24 @@ async function callOpenRouter(prompt) {
   let lastError = null;
   for (const model of models) {
     try {
+      console.log(`[ToxProfile] Trying model: ${model}`);
       const res = await fetch(OPENROUTER_URL, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
           'Content-Type': 'application/json',
           'HTTP-Referer': OPENROUTER_SITE_URL,
-          'X-OpenRouter-Title': OPENROUTER_APP_NAME,
+          'X-Title': OPENROUTER_APP_NAME,
         },
         body: JSON.stringify({
           model,
-          messages: [{ role: 'user', content: prompt }],
+          messages: [
+            {
+              role: 'system',
+              content: 'Tu es un toxicologue expert. Tu réponds uniquement en JSON valide, sans backticks ni commentaires. Tu rédiges en français.',
+            },
+            { role: 'user', content: prompt },
+          ],
           temperature: 0.1,
           max_tokens: 8192,
           response_format: { type: 'json_object' },
@@ -559,6 +814,7 @@ async function callOpenRouter(prompt) {
       if (!res.ok) {
         const err = await res.text();
         lastError = new Error(`OpenRouter API error ${res.status} (${model}): ${err.substring(0, 400)}`);
+        console.warn(`[ToxProfile] ${lastError.message}`);
         continue;
       }
 
@@ -566,9 +822,11 @@ async function callOpenRouter(prompt) {
       const text = data?.choices?.[0]?.message?.content || '';
       if (!text) {
         lastError = new Error(`Réponse OpenRouter vide (${model})`);
+        console.warn(`[ToxProfile] ${lastError.message}`);
         continue;
       }
 
+      // Parse JSON from response (handle potential markdown wrapping)
       const clean = text
         .replace(/^```json\s*/i, '')
         .replace(/^```\s*/i, '')
@@ -579,30 +837,35 @@ async function callOpenRouter(prompt) {
       const lastBrace = clean.lastIndexOf('}');
       if (firstBrace === -1 || lastBrace <= firstBrace) {
         lastError = new Error(`Pas de JSON dans la réponse OpenRouter (${model})`);
+        console.warn(`[ToxProfile] ${lastError.message} — raw: ${clean.substring(0, 200)}`);
         continue;
       }
 
       const parsed = JSON.parse(clean.slice(firstBrace, lastBrace + 1));
       parsed._model = model;
+      console.log(`[ToxProfile] Model ${model} succeeded.`);
       return parsed;
     } catch (e) {
       lastError = e;
+      console.warn(`[ToxProfile] Model ${model} failed: ${e.message}`);
     }
   }
 
   throw lastError || new Error('Tous les modèles OpenRouter ont échoué');
 }
 
+// ─── Prompts ──────────────────────────────────────────────────────────────────
+
 const COMMON_RULES = `Règles impératives :
-- Réponds uniquement en JSON valide.
-- N'invente aucune donnée.
+- Réponds uniquement en JSON valide, sans backticks ni texte autour.
+- N'invente aucune donnée. Utilise uniquement les données fournies ci-dessous.
 - Si les données sont insuffisantes pour une section, renvoie available=false et content="Données non disponibles dans les sources consultées."
-- Sois synthétique mais précis.
+- Sois synthétique mais précis (5-15 phrases par section quand les données le permettent).
 - Rédige en français.
 - Conserve exactement les clés JSON demandées.`;
 
 function buildPrompt1(substanceName, cas, pubchemText, hsdbText) {
-  return `Tu es toxicologue expert. Rédige deux sections d'un profil ECHA/REACH.
+  return `Rédige deux sections d'un profil toxicologique ECHA/REACH.
 ${COMMON_RULES}
 Substance : ${substanceName} | CAS : ${cas}
 
@@ -610,24 +873,24 @@ JSON attendu :
 {
   "toxicokinetics": {
     "title": "Toxicocinétique (ADME)",
-    "content": "Absorption, distribution, métabolisme et élimination. Mentionner les voies et les principaux métabolites si disponibles.",
+    "content": "Absorption (voie orale, inhalation, cutanée), distribution tissulaire, métabolisme (métabolites principaux, enzymes impliquées), élimination (demi-vie, voies d'excrétion).",
     "available": true
   },
   "acuteToxicity": {
     "title": "Toxicité aiguë",
-    "content": "Données orales, cutanées, inhalation, signes cliniques, valeurs DL50/CL50 si disponibles. Privilégier les données humaines puis animales.",
+    "content": "Données orales, cutanées, inhalation. Signes cliniques, valeurs DL50/CL50. Privilégier données humaines puis animales.",
     "available": true
   }
 }
 
-=== DONNÉES PUBCHEM ===
+=== DONNÉES PUBCHEM (toxicité, GHS) ===
 ${pubchemText}
-=== DONNÉES HSDB (ADME / Toxicité aiguë) ===
+=== DONNÉES HSDB (ADME, Pharmacologie, Toxicité aiguë, Valeurs DL50/CL50) ===
 ${hsdbText || 'Non disponible'}`;
 }
 
 function buildPrompt2(substanceName, cas, pubchemText, hsdbText) {
-  return `Tu es toxicologue expert. Rédige trois sections d'un profil ECHA/REACH.
+  return `Rédige trois sections d'un profil toxicologique ECHA/REACH.
 ${COMMON_RULES}
 Substance : ${substanceName} | CAS : ${cas}
 
@@ -635,29 +898,29 @@ JSON attendu :
 {
   "irritationCorrosion": {
     "title": "Irritation / corrosion",
-    "content": "Effets peau, yeux, voies respiratoires. Préciser si irritation légère, sévère, corrosion, ou absence d'effet.",
+    "content": "Effets peau, yeux, voies respiratoires. Préciser si irritation légère, sévère, corrosion, ou absence d'effet. Citer les tests (Draize, etc.) si disponibles.",
     "available": true
   },
   "sensitization": {
     "title": "Sensibilisation",
-    "content": "Données de sensibilisation cutanée ou respiratoire, humaines ou animales, y compris cas professionnels documentés.",
+    "content": "Données de sensibilisation cutanée ou respiratoire, humaines ou animales, y compris cas professionnels documentés. Mentionner les tests utilisés (LLNA, Guinea pig, patch test).",
     "available": true
   },
   "repeatedDoseToxicity": {
     "title": "Toxicité à doses répétées",
-    "content": "Études subchroniques/chroniques, organes cibles, effets principaux, NOAEL/LOAEL si disponibles.",
+    "content": "Études subchroniques/chroniques, organes cibles, effets principaux, NOAEL/LOAEL si disponibles, voies d'exposition et durées.",
     "available": true
   }
 }
 
-=== DONNÉES PUBCHEM ===
+=== DONNÉES PUBCHEM (toxicité, GHS) ===
 ${pubchemText}
-=== DONNÉES HSDB (Irritation / Sensibilisation / Doses répétées) ===
+=== DONNÉES HSDB (Irritation, Sensibilisation, Doses répétées, Surveillance médicale) ===
 ${hsdbText || 'Non disponible'}`;
 }
 
 function buildPrompt3(substanceName, cas, pubchemText, hsdbText) {
-  return `Tu es toxicologue expert. Rédige trois sections d'un profil ECHA/REACH.
+  return `Rédige trois sections d'un profil toxicologique ECHA/REACH.
 ${COMMON_RULES}
 Substance : ${substanceName} | CAS : ${cas}
 
@@ -665,29 +928,29 @@ JSON attendu :
 {
   "genotoxicity": {
     "title": "Mutagénicité / Génotoxicité",
-    "content": "Tests in vitro (Ames, aberrations chromosomiques, SCE, micronoyaux) et in vivo. Résultats positifs/négatifs. Données humaines si disponibles.",
+    "content": "Tests in vitro (Ames, aberrations chromosomiques, SCE, micronoyaux, mutation génique) et in vivo (micronoyaux moelle osseuse, test comète, etc.). Résultats positifs/négatifs avec et sans activation métabolique (S9). Données humaines si disponibles.",
     "available": true
   },
   "carcinogenicity": {
     "title": "Cancérogénicité",
-    "content": "Classifications IARC/EPA/NTP/ACGIH. Données épidémiologiques humaines et données animales. Organes cibles si disponibles.",
+    "content": "Classifications IARC/EPA/NTP/ACGIH/MAK. Données épidémiologiques humaines et études animales à long terme. Organes cibles, types de tumeurs si disponibles.",
     "available": true
   },
   "reproductiveToxicity": {
     "title": "Toxicité pour la reproduction et le développement",
-    "content": "Effets sur la fertilité, embryotoxicité, fœtotoxicité, tératogénicité. Données humaines et animales avec voies et niveaux d'exposition.",
+    "content": "Effets sur la fertilité (mâle/femelle), embryotoxicité, fœtotoxicité, tératogénicité. Données humaines et animales avec voies et niveaux d'exposition. NOAEL reprotox si disponible.",
     "available": true
   }
 }
 
-=== DONNÉES PUBCHEM ===
+=== DONNÉES PUBCHEM (toxicité, GHS) ===
 ${pubchemText}
-=== DONNÉES HSDB (Génotoxicité / Cancérogénicité / Reproduction) ===
+=== DONNÉES HSDB (Génotoxicité, Cancérogénicité, Reproduction, Développement) ===
 ${hsdbText || 'Non disponible'}`;
 }
 
 function buildPrompt4(substanceName, cas, pubchemText, hsdbText) {
-  return `Tu es toxicologue expert. Rédige deux sections d'un profil ECHA/REACH.
+  return `Rédige deux sections d'un profil toxicologique ECHA/REACH.
 ${COMMON_RULES}
 Substance : ${substanceName} | CAS : ${cas}
 
@@ -695,21 +958,23 @@ JSON attendu :
 {
   "humanData": {
     "title": "Données humaines",
-    "content": "Études épidémiologiques, cas cliniques, expositions professionnelles documentées. Effets observés, populations étudiées, niveaux d'exposition.",
+    "content": "Études épidémiologiques, cas cliniques, expositions professionnelles documentées. Effets observés, populations étudiées, niveaux d'exposition quand disponibles.",
     "available": true
   },
   "referenceValues": {
     "title": "Valeurs toxicologiques de référence",
-    "content": "MRL ATSDR, RfC/RfD EPA IRIS, slope factor oral, IUR inhalation, TLV-TWA ACGIH ou autres valeurs repérées dans les sources.",
+    "content": "Citer toutes les VTR trouvées : MRL ATSDR (aiguë, intermédiaire, chronique), RfC/RfD EPA IRIS, slope factor oral, IUR inhalation, TLV-TWA ACGIH, OEL, DNEL, ou autres. Indiquer voie, durée, valeur numérique et source.",
     "available": true
   }
 }
 
-=== DONNÉES PUBCHEM ===
+=== DONNÉES PUBCHEM (toxicité, GHS, VTR) ===
 ${pubchemText}
-=== DONNÉES HSDB / PUBCHEM (Données humaines / Standards / VTR) ===
+=== DONNÉES HSDB / PUBCHEM (Standards professionnels, NIOSH, VTR) ===
 ${hsdbText || 'Non disponible'}`;
 }
+
+// ─── Main entry point ─────────────────────────────────────────────────────────
 
 export async function generateToxProfile(cas) {
   const normalizedCas = String(cas || '').trim();
@@ -736,21 +1001,31 @@ export async function generateToxProfile(cas) {
   const fullRoot = fullData?.Record || null;
 
   const pubchemText = buildPubchemText(toxRoot, ghsRoot, fullRoot);
-  const { hsdb1, hsdb2, hsdb3, hsdb4, foundHeadings } = buildHsdbGroupsFromFullRecord(fullRoot);
+  const { hsdb1, hsdb2, hsdb3, hsdb4, foundHeadings } = buildHsdbGroups(fullRoot);
 
-  console.log(`[ToxProfile] PubChem: ${pubchemText.length} chars | HSDB groups: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
+  console.log(`[ToxProfile] PubChem text: ${pubchemText.length} chars`);
+  console.log(`[ToxProfile] HSDB groups: ${hsdb1.length}/${hsdb2.length}/${hsdb3.length}/${hsdb4.length} chars`);
   console.log(`[ToxProfile] HSDB headings found: ${foundHeadings.join(', ') || '(none)'}`);
+
+  // Enrich prompt 4 with EPA IRIS / RAIS data from full PUG-View
+  const epaIrisSection = findSection(fullRoot, 'EPA IRIS Information');
+  const epaPPRTVSection = findSection(fullRoot, 'EPA Provisional Peer-Reviewed Toxicity Values');
+  const raisSection = findSection(fullRoot, 'RAIS Toxicity Values');
+  const vtrSupplement = serializeSections({
+    'EPA IRIS Information': epaIrisSection ? extractTableLikeSection(epaIrisSection) : [],
+    'EPA Provisional Peer-Reviewed Toxicity Values': epaPPRTVSection ? extractTableLikeSection(epaPPRTVSection) : [],
+    'RAIS Toxicity Values': raisSection ? extractTableLikeSection(raisSection) : [],
+  });
+
   console.log('[ToxProfile] Sending 4 parallel prompts to OpenRouter…');
 
   const [result1, result2, result3, result4] = await Promise.all([
     callOpenRouter(buildPrompt1(substanceName, normalizedCas, pubchemText, hsdb1)),
     callOpenRouter(buildPrompt2(substanceName, normalizedCas, pubchemText, hsdb2)),
     callOpenRouter(buildPrompt3(substanceName, normalizedCas, pubchemText, hsdb3)),
-    callOpenRouter(buildPrompt4(substanceName, normalizedCas, pubchemText, hsdb4 + '\n\n' + serializeSections({
-      'EPA IRIS Information': findSection(fullRoot, 'EPA IRIS Information') ? extractTableLikeSection(findSection(fullRoot, 'EPA IRIS Information')) : [],
-      'EPA Provisional Peer-Reviewed Toxicity Values': findSection(fullRoot, 'EPA Provisional Peer-Reviewed Toxicity Values') ? extractTableLikeSection(findSection(fullRoot, 'EPA Provisional Peer-Reviewed Toxicity Values')) : [],
-      'RAIS Toxicity Values': findSection(fullRoot, 'RAIS Toxicity Values') ? extractTableLikeSection(findSection(fullRoot, 'RAIS Toxicity Values')) : [],
-    }))),
+    callOpenRouter(buildPrompt4(substanceName, normalizedCas, pubchemText,
+      hsdb4 + (vtrSupplement ? '\n\n' + vtrSupplement : '')
+    )),
   ]);
 
   const sectionOrder = [
