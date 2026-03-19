@@ -1,25 +1,42 @@
-name: Build Turso Indexes
-
+name: Build VTR Index
 on:
   workflow_dispatch:
-
 jobs:
-  build-indexes:
+  build-vtr:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Install @libsql/client
-        run: npm install @libsql/client
-
-
-
+      - run: npm install @libsql/client
       - name: Build VTR index
         env:
           TURSO_VTR_URL: ${{ secrets.TURSO_VTR_URL }}
           TURSO_VTR_TOKEN: ${{ secrets.TURSO_VTR_TOKEN }}
-        run: node scripts/build-vtr-index.js
+        run: |
+          cat << 'EOF' > vtr.mjs
+          import { createClient } from '@libsql/client';
+          const db = createClient({ url: process.env.TURSO_VTR_URL, authToken: process.env.TURSO_VTR_TOKEN });
+          function normalizeCas(raw) { if (!raw) return ''; let s = String(raw).trim().replace(/\s/g, '').replace(/CAS|cas|№|No\./g, ''); const m = s.match(/(\d{2,7}-\d{2}-\d)/); return m ? m[1] : s; }
+          function extractCasList(raw) { if (!raw) return []; return String(raw).replace(/CAS[: ]*/gi, '').split(/[;,/]|\\n/).map(normalizeCas).filter(Boolean); }
+          await db.execute('DROP TABLE IF EXISTS vtr_cas_lookup');
+          await db.execute('CREATE TABLE vtr_cas_lookup (cas TEXT NOT NULL, row_id INTEGER NOT NULL)');
+          let offset = 0, total = 0;
+          while (true) {
+            const r = await db.execute({ sql: 'SELECT id, cas FROM vtr_all LIMIT 2000 OFFSET ?', args: [offset] });
+            if (!r.rows.length) break;
+            const ins = [];
+            for (const row of r.rows) { const id = Number(row.id); if (isNaN(id)) continue; for (const cas of extractCasList(String(row.cas||''))) { if (cas) ins.push(cas, id); } }
+            if (ins.length) {
+              const n = ins.length / 2;
+              const ph = Array.from({length: n}, () => '(?,?)').join(',');
+              await db.execute({ sql: 'INSERT INTO vtr_cas_lookup (cas,row_id) VALUES ' + ph, args: ins });
+            }
+            total += ins.length / 2;
+            offset += 2000;
+            if (r.rows.length < 2000) break;
+          }
+          await db.execute('CREATE INDEX IF NOT EXISTS idx_vtr_cas_lookup ON vtr_cas_lookup (cas)');
+          console.log('Done! vtr_cas_lookup: ' + total + ' entries');
+          EOF
+          node vtr.mjs
