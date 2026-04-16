@@ -1,35 +1,15 @@
-// server/index.js — Toxonomy Backend (Node.js + Express + better-sqlite3 + Backblaze B2)
+// server/index.js — Toxonomy Backend (Node.js + Express + better-sqlite3 + Git LFS)
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
-import { pipeline } from 'stream/promises';
+import { existsSync } from 'fs';
 import ExcelJS from 'exceljs';
 import { generateToxProfile, getCacheStats } from './toxProfile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 const PORT = process.env.PORT || 5000;
-
-// ─── DB download from Backblaze ───────────────────────────────────────────────
-async function downloadDB(name) {
-  const local = path.join(DATA_DIR, name);
-  if (existsSync(local)) { console.log(`${name} already present.`); return local; }
-  console.log(`Downloading ${name} from Backblaze…`);
-  const s3 = new S3Client({
-    endpoint: process.env.B2_ENDPOINT,
-    region: 'auto',
-    credentials: { accessKeyId: process.env.B2_KEY_ID_RO, secretAccessKey: process.env.B2_APP_KEY_RO },
-  });
-  const prefix = process.env.B2_PREFIX || 'db/';
-  const resp = await s3.send(new GetObjectCommand({ Bucket: process.env.B2_BUCKET, Key: `${prefix}${name}` }));
-  await pipeline(resp.Body, createWriteStream(local));
-  console.log(`${name} downloaded.`);
-  return local;
-}
 
 // ─── CAS normalization ────────────────────────────────────────────────────────
 function normalizeCas(raw) {
@@ -181,11 +161,13 @@ function buildNameSearchIndex(nameIndex) {
 
 // ─── Server startup ───────────────────────────────────────────────────────────
 async function main() {
-  await downloadDB('Classifications.db');
-  await downloadDB('VTR.db');
+  // DB files are bundled via Git LFS at the repo root
+  const classDbPath = path.join(__dirname, '..', 'Classifications.db');
+  const vtrDbPath = path.join(__dirname, '..', 'VTR.db');
 
-  const classDbPath = path.join(DATA_DIR, 'Classifications.db');
-  const vtrDbPath = path.join(DATA_DIR, 'VTR.db');
+  if (!existsSync(classDbPath)) throw new Error(`Classifications.db not found at ${classDbPath}`);
+  if (!existsSync(vtrDbPath)) throw new Error(`VTR.db not found at ${vtrDbPath}`);
+  console.log('DB files found.');
 
   // Create indexes then reopen readonly
   const writeDb = new Database(classDbPath);
