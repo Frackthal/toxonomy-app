@@ -104,7 +104,7 @@ function buildCasIndex(db) {
   for (const table of tables) {
     try {
       // Select only needed columns — avoids loading full rows into RAM
-      const stmt = db.prepare(`SELECT rowid, CAS, "Substance Name" FROM "${table}"`);
+      const stmt = db.prepare(`SELECT rowid AS rowid, CAS, "Substance Name" FROM "${table}"`);
       for (const row of stmt.iterate()) {
         const allCas = extractCasList(row.CAS);
         for (const cas of allCas) {
@@ -135,7 +135,7 @@ function buildVtrIndex(db) {
   console.log('Building VTR index…');
   const index = new Map();
   try {
-    for (const row of db.prepare('SELECT rowid, cas FROM vtr_all').iterate()) {
+    for (const row of db.prepare('SELECT rowid AS rowid, cas FROM vtr_all').iterate()) {
       const allCas = extractCasList(row.cas);
       for (const cas of allCas) {
         const n = normalizeCas(cas);
@@ -325,7 +325,7 @@ async function main() {
       const placeholders = rowids.map(() => '?').join(',');
       let matching = [];
       try {
-        matching = vtrDb.prepare(`SELECT * FROM vtr_all WHERE rowid IN (${placeholders})`).all(...rowids);
+        matching = vtrDb.prepare(`SELECT rowid AS rowid, * FROM vtr_all WHERE rowid IN (${placeholders})`).all(...rowids);
       } catch (e) {}
 
       const authorities = new Set();
@@ -561,7 +561,7 @@ async function main() {
       const placeholders = rowids.map(() => '?').join(',');
       let rows = [];
       try {
-        rows = vtrDb.prepare(`SELECT * FROM vtr_all WHERE rowid IN (${placeholders})`).all(...rowids);
+        rows = vtrDb.prepare(`SELECT rowid AS rowid, * FROM vtr_all WHERE rowid IN (${placeholders})`).all(...rowids);
       } catch (e) { continue; }
 
       for (const row of rows) {
