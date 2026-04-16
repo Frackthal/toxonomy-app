@@ -1,25 +1,35 @@
-// server/index.js — Toxonomy Backend (Node.js + Express + Turso)
+// server/index.js — Toxonomy Backend (Node.js + Express + better-sqlite3 + Backblaze B2)
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { existsSync } from 'fs';
+import Database from 'better-sqlite3';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { pipeline } from 'stream/promises';
 import ExcelJS from 'exceljs';
-import { createClient } from '@libsql/client';
 import { generateToxProfile, getCacheStats } from './toxProfile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 const PORT = process.env.PORT || 5000;
 
-// ─── Turso clients ────────────────────────────────────────────────────────────
-const classDb = createClient({
-  url: process.env.TURSO_CLASSIFICATIONS_URL,
-  authToken: process.env.TURSO_CLASSIFICATIONS_TOKEN,
-});
-const vtrDb = createClient({
-  url: process.env.TURSO_VTR_URL,
-  authToken: process.env.TURSO_VTR_TOKEN,
-});
+// ─── DB download from Backblaze ───────────────────────────────────────────────
+async function downloadDB(name) {
+  const local = path.join(DATA_DIR, name);
+  if (existsSync(local)) { console.log(`${name} already present.`); return local; }
+  console.log(`Downloading ${name} from Backblaze…`);
+  const s3 = new S3Client({
+    endpoint: process.env.B2_ENDPOINT,
+    region: 'auto',
+    credentials: { accessKeyId: process.env.B2_KEY_ID_RO, secretAccessKey: process.env.B2_APP_KEY_RO },
+  });
+  const prefix = process.env.B2_PREFIX || 'db/';
+  const resp = await s3.send(new GetObjectCommand({ Bucket: process.env.B2_BUCKET, Key: `${prefix}${name}` }));
+  await pipeline(resp.Body, createWriteStream(local));
+  console.log(`${name} downloaded.`);
+  return local;
+}
 
 // ─── CAS normalization ────────────────────────────────────────────────────────
 function normalizeCas(raw) {
@@ -77,8 +87,6 @@ const FLAT_OPTIONS = [
   { label: 'ATSDR Hazards', value: 'ATSDR_Hazards', group: 'Autres' },
 ];
 
-const VALID_TABLES = new Set(FLAT_OPTIONS.map(o => o.value));
-
 const CMR_COLUMNS = { 'Carcinogenicity': 'carcinogen', 'Germ cell mutagenicity': 'mutagen', 'Reproductive toxicity': 'reprotoxic' };
 
 const EXCLUDED_COLUMNS = {
@@ -105,135 +113,106 @@ const SPECIAL_CARCINOGENICITY = {
   MAK_Carcinogens: (r) => r['Carc.'] && !['', '5'].includes(String(r['Carc.']).trim()),
 };
 
-// ─── Load indexes from Turso lookup tables into memory at startup ─────────────
-async function loadCasIndex() {
-  console.log('Loading CAS index from Turso…');
-  const index = new Map(); // cas → { table → [rowid, …] }
-  let offset = 0;
-  const batchSize = 5000;
-  while (true) {
-    const r = await classDb.execute({
-      sql: 'SELECT cas, table_name, row_id FROM cas_lookup LIMIT ? OFFSET ?',
-      args: [batchSize, offset],
-    });
-    if (r.rows.length === 0) break;
-    for (const row of r.rows) {
-      if (!index.has(row.cas)) index.set(row.cas, {});
-      const entry = index.get(row.cas);
-      if (!entry[row.table_name]) entry[row.table_name] = [];
-      entry[row.table_name].push(row.row_id);
-    }
-    offset += batchSize;
-  }
-  console.log(`CAS index loaded: ${index.size} unique CAS numbers`);
-  return index;
-}
-
-async function loadNameIndex() {
-  console.log('Loading name index from Turso…');
+// ─── Index building ───────────────────────────────────────────────────────────
+function buildCasIndex(db) {
+  console.log('Building CAS index…');
+  const tables = FLAT_OPTIONS.map(o => o.value);
   const index = new Map();
-  let offset = 0;
-  const batchSize = 5000;
-  while (true) {
-    const r = await classDb.execute({
-      sql: 'SELECT cas, name FROM name_lookup LIMIT ? OFFSET ?',
-      args: [batchSize, offset],
-    });
-    if (r.rows.length === 0) break;
-    for (const row of r.rows) {
-      index.set(row.cas, row.name);
+  const nameIndex = new Map();
+  const nameTables = ['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China'];
+
+  for (const table of tables) {
+    try {
+      const rows = db.prepare(`SELECT rowid, * FROM "${table}"`).all();
+      for (const row of rows) {
+        const allCas = extractCasList(row.CAS);
+        for (const cas of allCas) {
+          const n = normalizeCas(cas);
+          if (!n) continue;
+          if (!index.has(n)) index.set(n, {});
+          const entry = index.get(n);
+          if (!entry[table]) entry[table] = [];
+          entry[table].push(row.rowid);
+
+          if (nameTables.includes(table) && !nameIndex.has(n)) {
+            const name = row['Substance Name'];
+            if (name) nameIndex.set(n, String(name).trim());
+          }
+        }
+      }
+    } catch (e) {
+      // Table might not exist
     }
-    offset += batchSize;
   }
-  console.log(`Name index loaded: ${index.size} entries`);
-  return index;
+
+  console.log(`CAS index built: ${index.size} unique CAS numbers across ${tables.length} tables`);
+  return { index, nameIndex };
 }
 
-async function loadVtrIndex() {
-  console.log('Loading VTR index from Turso…');
+function buildVtrIndex(db) {
+  console.log('Building VTR index…');
   const index = new Map();
-  let offset = 0;
-  const batchSize = 5000;
-  while (true) {
-    const r = await vtrDb.execute({
-      sql: 'SELECT cas, row_id FROM vtr_cas_lookup LIMIT ? OFFSET ?',
-      args: [batchSize, offset],
-    });
-    if (r.rows.length === 0) break;
-    for (const row of r.rows) {
-      if (!index.has(row.cas)) index.set(row.cas, []);
-      index.get(row.cas).push(row.row_id);
+  try {
+    const rows = db.prepare('SELECT rowid, cas FROM vtr_all').all();
+    for (const row of rows) {
+      const allCas = extractCasList(row.cas);
+      for (const cas of allCas) {
+        const n = normalizeCas(cas);
+        if (!n) continue;
+        if (!index.has(n)) index.set(n, []);
+        index.get(n).push(row.rowid);
+      }
     }
-    offset += batchSize;
+  } catch (e) {
+    console.warn('Could not build VTR index:', e.message);
   }
-  console.log(`VTR index loaded: ${index.size} unique CAS numbers`);
+  console.log(`VTR index built: ${index.size} unique CAS numbers`);
   return index;
 }
 
-async function loadVtrColumns() {
-  try {
-    const r = await vtrDb.execute('SELECT * FROM vtr_all LIMIT 1');
-    if (r.rows.length > 0) return Object.keys(r.rows[0]);
-  } catch (e) {}
-  return [];
-}
-
-// ─── Turso row fetch helper ───────────────────────────────────────────────────
-async function fetchRow(db, table, rowid) {
-  if (!VALID_TABLES.has(table)) return null;
-  try {
-    const r = await db.execute({
-      sql: `SELECT * FROM "${table}" WHERE rowid = ?`,
-      args: [rowid],
-    });
-    return r.rows[0] || null;
-  } catch (e) {
-    return null;
+function buildNameSearchIndex(nameIndex) {
+  const arr = [];
+  for (const [cas, name] of nameIndex.entries()) {
+    arr.push({ cas, name, nameLower: name.toLowerCase() });
   }
-}
-
-async function fetchRows(db, table, rowids) {
-  if (!VALID_TABLES.has(table) || !rowids.length) return [];
-  try {
-    const placeholders = rowids.map(() => '?').join(',');
-    const r = await db.execute({
-      sql: `SELECT * FROM "${table}" WHERE rowid IN (${placeholders})`,
-      args: rowids,
-    });
-    return r.rows;
-  } catch (e) {
-    return [];
-  }
-}
-
-async function fetchVtrRows(rowids) {
-  if (!rowids.length) return [];
-  try {
-    const placeholders = rowids.map(() => '?').join(',');
-    const r = await vtrDb.execute({
-      sql: `SELECT * FROM vtr_all WHERE rowid IN (${placeholders})`,
-      args: rowids,
-    });
-    return r.rows;
-  } catch (e) {
-    return [];
-  }
+  return arr;
 }
 
 // ─── Server startup ───────────────────────────────────────────────────────────
 async function main() {
-  // Load indexes from Turso lookup tables into memory
-  const casIndex = await loadCasIndex();
-  const nameIndex = await loadNameIndex();
-  const vtrIndex = await loadVtrIndex();
-  const vtrAllColumns = await loadVtrColumns();
-  const vtrVisibleColumns = vtrAllColumns.filter(c => !['id', 'source_system', 'raw_source'].includes(c));
+  await downloadDB('Classifications.db');
+  await downloadDB('VTR.db');
 
-  // Name search array (for substring matching)
-  const nameSearchArr = [];
-  for (const [cas, name] of nameIndex.entries()) {
-    nameSearchArr.push({ cas, name, nameLower: name.toLowerCase() });
+  const classDbPath = path.join(DATA_DIR, 'Classifications.db');
+  const vtrDbPath = path.join(DATA_DIR, 'VTR.db');
+
+  // Create indexes then reopen readonly
+  const writeDb = new Database(classDbPath);
+  writeDb.pragma('journal_mode = WAL');
+  for (const t of FLAT_OPTIONS.map(o => o.value)) {
+    try {
+      writeDb.exec(`CREATE INDEX IF NOT EXISTS "idx_${t}_cas" ON "${t}" (CAS)`);
+    } catch (e) { /* table might not exist */ }
   }
+  writeDb.close();
+  console.log('SQL indexes created.');
+
+  const classDb = new Database(classDbPath, { readonly: true });
+  classDb.pragma('cache_size = -64000');
+  const vtrDb = new Database(vtrDbPath, { readonly: true });
+
+  // Build in-memory indexes
+  const { index: casIndex, nameIndex } = buildCasIndex(classDb);
+  const vtrIndex = buildVtrIndex(vtrDb);
+  const nameSearchArr = buildNameSearchIndex(nameIndex);
+
+  // VTR columns
+  let vtrVisibleColumns = [];
+  try {
+    const stmt = vtrDb.prepare('SELECT * FROM vtr_all LIMIT 1');
+    stmt.all();
+    vtrVisibleColumns = stmt.columns().map(c => c.name).filter(c => !['id', 'source_system', 'raw_source'].includes(c));
+  } catch (e) {}
 
   const app = express();
   app.use(cors({ origin: '*' }));
@@ -259,7 +238,7 @@ async function main() {
   });
 
   // ─── API: Main search ─────────────────────────────────────────────────────
-  app.post('/api/search', async (req, res) => {
+  app.post('/api/search', (req, res) => {
     const { cas_numbers = [], classifications = [] } = req.body;
     const casList = cas_numbers.map(normalizeCas).filter(Boolean);
     const selectedTables = new Set(classifications);
@@ -292,13 +271,14 @@ async function main() {
         const prettyTable = table.replace(/_/g, ' ');
         if (!entry.sources.includes(prettyTable)) entry.sources.push(prettyTable);
 
-        const row = await fetchRow(classDb, table, rowids[0]);
+        let row;
+        try {
+          row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]);
+        } catch (e) { continue; }
         if (!row) continue;
 
         for (const [col, key] of Object.entries(CMR_COLUMNS)) {
-          if (row[col] !== undefined && isClassified(row[col])) {
-            entry.CMR[key] = true;
-          }
+          if (row[col] !== undefined && isClassified(row[col])) entry.CMR[key] = true;
         }
 
         if (SPECIAL_CARCINOGENICITY[table]) {
@@ -328,9 +308,7 @@ async function main() {
         entry.details[table] = {};
         for (const col of Object.keys(row)) {
           if (col === 'CAS' || col === 'Substance Name' || excluded.has(col)) continue;
-          if (isClassified(row[col])) {
-            entry.details[table][col] = row[col];
-          }
+          if (isClassified(row[col])) entry.details[table][col] = row[col];
         }
       }
 
@@ -342,7 +320,7 @@ async function main() {
   });
 
   // ─── API: VTR search ──────────────────────────────────────────────────────
-  app.post('/api/vtr', async (req, res) => {
+  app.post('/api/vtr', (req, res) => {
     const { cas_numbers = [] } = req.body;
     const casList = cas_numbers.map(normalizeCas).filter(Boolean);
     const result = {};
@@ -361,7 +339,12 @@ async function main() {
         continue;
       }
 
-      const matching = await fetchVtrRows(rowids);
+      const placeholders = rowids.map(() => '?').join(',');
+      let matching = [];
+      try {
+        matching = vtrDb.prepare(`SELECT * FROM vtr_all WHERE rowid IN (${placeholders})`).all(...rowids);
+      } catch (e) {}
+
       const authorities = new Set();
       for (const row of matching) {
         if (row.authority) authorities.add(String(row.authority));
@@ -385,7 +368,7 @@ async function main() {
     res.json(result);
   });
 
-  // ─── API: Export ──────────────────────────────────────────────────────────
+  // ─── API: Export (basic CSV/XLSX) ─────────────────────────────────────────
   app.post('/api/export', async (req, res) => {
     const { cas_numbers = [], classifications = [], format = 'xlsx' } = req.body;
     const casList = cas_numbers.map(normalizeCas).filter(Boolean);
@@ -405,7 +388,8 @@ async function main() {
         const rowids = tableMap[table];
         if (!rowids?.length) continue;
         found = true;
-        const row = await fetchRow(classDb, table, rowids[0]);
+        let row;
+        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
         if (!row) continue;
 
         const cols = Object.keys(row).filter(c => !['CAS', 'Substance Name', 'cid'].includes(c));
@@ -445,7 +429,7 @@ async function main() {
     res.end();
   });
 
-  // ─── API: Export Multiple (one sheet per source) ─────────────────────────
+  // ─── API: Export Multiple (one sheet per source) ──────────────────────────
   app.post('/api/export/multiple', async (req, res) => {
     const { cas_numbers = [], classifications = [] } = req.body;
     const casList = cas_numbers.map(normalizeCas).filter(Boolean);
@@ -466,11 +450,15 @@ async function main() {
         const rowids = tableMap[table];
         if (!rowids?.length) continue;
 
-        const rows = await fetchRows(classDb, table, rowids);
+        let rows = [];
+        try {
+          const placeholders = rowids.map(() => '?').join(',');
+          rows = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid IN (${placeholders})`).all(...rowids);
+        } catch (e) { continue; }
+
         for (const row of rows) {
           if (!allColumns) allColumns = Object.keys(row).filter(c => c !== 'rowid');
-          const enriched = { CAS: cas, 'Substance Name': nameIndex.get(cas) || row['Substance Name'] || '', ...row };
-          sheetRows.push(enriched);
+          sheetRows.push({ CAS: cas, 'Substance Name': nameIndex.get(cas) || row['Substance Name'] || '', ...row });
         }
       }
 
@@ -490,12 +478,9 @@ async function main() {
       const hrow = ws.getRow(1);
       hrow.font = HEADER_FONT;
       hrow.fill = HEADER_FILL;
-      hrow.alignment = { wrapText: false };
     }
 
-    if (wb.worksheets.length === 0) {
-      wb.addWorksheet('Aucun résultat');
-    }
+    if (wb.worksheets.length === 0) wb.addWorksheet('Aucun résultat');
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename=export_multiple.xlsx');
@@ -503,13 +488,14 @@ async function main() {
     res.end();
   });
 
-  // ─── API: Export Combined (one sheet, all sources merged) ────────────────
+  // ─── API: Export Combined (one sheet, all sources merged) ─────────────────
   app.post('/api/export/combined', async (req, res) => {
     const { cas_numbers = [], classifications = [] } = req.body;
     const casList = cas_numbers.map(normalizeCas).filter(Boolean);
     const selectedTables = classifications;
     if (!casList.length || !selectedTables.length) return res.status(400).json({ error: 'Missing params' });
 
+    // Discover which columns have data per table
     const tableColMap = {};
     for (const cas of casList) {
       const tableMap = casIndex.get(cas);
@@ -517,7 +503,8 @@ async function main() {
       for (const table of selectedTables) {
         const rowids = tableMap[table];
         if (!rowids?.length) continue;
-        const row = await fetchRow(classDb, table, rowids[0]);
+        let row;
+        try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
         if (!row) continue;
         if (!tableColMap[table]) tableColMap[table] = new Set();
         const excluded = new Set(['CAS', 'Substance Name', ...(EXCLUDED_COLUMNS[table] || [])]);
@@ -528,12 +515,13 @@ async function main() {
       }
     }
 
-    const colKeys = [];
-    colKeys.push({ key: 'CAS', header: 'CAS' });
-    colKeys.push({ key: 'SubstanceName', header: 'Substance Name' });
+    const colKeys = [
+      { key: 'CAS', header: 'CAS' },
+      { key: 'SubstanceName', header: 'Substance Name' },
+    ];
     for (const table of selectedTables) {
       const cols = tableColMap[table];
-      if (!cols || !cols.size) continue;
+      if (!cols?.size) continue;
       const tableShort = table.replace(/_/g, ' ');
       for (const col of cols) {
         colKeys.push({ key: `${table}||${col}`, header: `${tableShort} — ${col}` });
@@ -548,13 +536,12 @@ async function main() {
         for (const table of selectedTables) {
           const rowids = tableMap[table];
           if (!rowids?.length) continue;
-          const row = await fetchRow(classDb, table, rowids[0]);
+          let row;
+          try { row = classDb.prepare(`SELECT * FROM "${table}" WHERE rowid = ?`).get(rowids[0]); } catch { continue; }
           if (!row) continue;
           const cols = tableColMap[table];
           if (!cols) continue;
-          for (const col of cols) {
-            rowObj[`${table}||${col}`] = row[col] ?? '';
-          }
+          for (const col of cols) rowObj[`${table}||${col}`] = row[col] ?? '';
         }
       }
       rows.push(rowObj);
@@ -588,7 +575,12 @@ async function main() {
     for (const cas of casList) {
       const rowids = vtrIndex.get(cas);
       if (!rowids?.length) continue;
-      const rows = await fetchVtrRows(rowids);
+      const placeholders = rowids.map(() => '?').join(',');
+      let rows = [];
+      try {
+        rows = vtrDb.prepare(`SELECT * FROM vtr_all WHERE rowid IN (${placeholders})`).all(...rowids);
+      } catch (e) { continue; }
+
       for (const row of rows) {
         if (!headerSet) {
           const cols = Object.keys(row).filter(c => !['id', 'source_system', 'raw_source'].includes(c));
