@@ -119,12 +119,13 @@ function buildCasIndex(db) {
   const tables = FLAT_OPTIONS.map(o => o.value);
   const index = new Map();
   const nameIndex = new Map();
-  const nameTables = ['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China'];
+  const nameTables = new Set(['CLP', 'GHS_Australia', 'GHS_Japan', 'GHS_Korea', 'GHS_China']);
 
   for (const table of tables) {
     try {
-      const rows = db.prepare(`SELECT rowid, * FROM "${table}"`).all();
-      for (const row of rows) {
+      // Select only needed columns — avoids loading full rows into RAM
+      const stmt = db.prepare(`SELECT rowid, CAS, "Substance Name" FROM "${table}"`);
+      for (const row of stmt.iterate()) {
         const allCas = extractCasList(row.CAS);
         for (const cas of allCas) {
           const n = normalizeCas(cas);
@@ -134,14 +135,15 @@ function buildCasIndex(db) {
           if (!entry[table]) entry[table] = [];
           entry[table].push(row.rowid);
 
-          if (nameTables.includes(table) && !nameIndex.has(n)) {
+          if (nameTables.has(table) && !nameIndex.has(n)) {
             const name = row['Substance Name'];
             if (name) nameIndex.set(n, String(name).trim());
           }
         }
       }
+      console.log(`  ✓ ${table}`);
     } catch (e) {
-      // Table might not exist
+      // Table might not exist or missing column — skip silently
     }
   }
 
@@ -153,8 +155,7 @@ function buildVtrIndex(db) {
   console.log('Building VTR index…');
   const index = new Map();
   try {
-    const rows = db.prepare('SELECT rowid, cas FROM vtr_all').all();
-    for (const row of rows) {
+    for (const row of db.prepare('SELECT rowid, cas FROM vtr_all').iterate()) {
       const allCas = extractCasList(row.cas);
       for (const cas of allCas) {
         const n = normalizeCas(cas);
